@@ -82,6 +82,21 @@ TAPER_B_BOUNDS = (0.15, 1.0)  # tip/root chord ratio of the tapered region
 # 0.60 for Plan_L and ~0.68 for ConstChord.
 WINGBOX_CHORD_PCT_BOUNDS = (0.45, 0.75)
 
+# Front-spar location as a fraction of chord. Fixed, unlike the rear spar: it is
+# the rear spar that has to stay unswept, so only that one drives the planform.
+# The structural box is everything between the two, so its width is
+# (wingbox_pct - WINGBOX_FRONT_PCT) * chord, and the box spans 12.5% to 75% of
+# chord when the rear spar sits at its upper bound.
+WINGBOX_FRONT_PCT = 0.125
+
+# Where the rear spar starts the optimization. The as-built VSP spars sit at
+# 0.60 (Plan_L) and 0.68 (ConstChord), which leaves a spar-to-spar box too
+# narrow for the inboard width requirement, so the design starts from the full
+# 12.5% -> 75% box instead of from the as-built geometry. The parameterization
+# still references the measured baseline, so the mesh at the measured spar
+# fraction is unchanged -- this moves the starting point, not the reference.
+WINGBOX_REAR_PCT_START = WINGBOX_CHORD_PCT_BOUNDS[1]
+
 # ---------------------------------------------------------------------------
 # Region detection overrides
 # ---------------------------------------------------------------------------

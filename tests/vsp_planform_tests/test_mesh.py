@@ -5,6 +5,10 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import openmdao.api as om
+
+from openaerostruct.aerodynamics.aero_groups import AeroPoint
+from openaerostruct.meshing.mesh_generator import generate_mesh
 
 # studies/ is not an installed package, so make the repo root importable by path.
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -278,6 +282,151 @@ class TestResample(unittest.TestCase):
         native = (mesh.shape[0] - 1) * (mesh.shape[1] - 1)
         reduced = (N_CHORDWISE - 1) * (config.N_SPANWISE_HALF - 1)
         self.assertLess(reduced, native / 3)
+
+
+def _mirror(mesh):
+    """Turn a right-half mesh into a left-half one, or the reverse."""
+    out = mesh[:, ::-1, :].copy()
+    out[:, :, 1] *= -1.0
+    return out
+
+
+def _coarse_half(name, n_spanwise=21, nx=5):
+    """A VLM-sized half mesh, small enough to solve quickly in a unit test."""
+    mesh, stick = half_mesh(config.BASELINES[name])
+    regions = detect_regions(stick)
+    y = spanwise_stations(mesh[0, :, 1], n_spanwise, regions.y_c_start * config.SCALE)
+    coarse, _ = resample(mesh, y, nx)
+    return coarse
+
+
+def _run_vlm(mesh, symmetry, alpha=3.0):
+    """CL, CD and S_ref from a bare VLM run on one mesh."""
+    surface = {
+        "name": "wing",
+        "symmetry": symmetry,
+        "S_ref_type": "wetted",
+        "mesh": mesh,
+        "twist_cp": np.zeros(2),
+        "CL0": 0.0,
+        "CD0": 0.0,
+        "k_lam": config.K_LAM,
+        "t_over_c_cp": np.array([0.15]),
+        "c_max_t": 0.303,
+        "with_viscous": False,
+        "with_wave": False,
+        "fem_origin": 0.35,
+    }
+
+    ivc = om.IndepVarComp()
+    ivc.add_output("v", val=config.V_MS, units="m/s")
+    ivc.add_output("alpha", val=alpha, units="deg")
+    ivc.add_output("Mach_number", val=config.MACH)
+    ivc.add_output("re", val=config.RE_PER_M, units="1/m")
+    ivc.add_output("rho", val=config.RHO, units="kg/m**3")
+    ivc.add_output("cg", val=np.zeros(3), units="m")
+
+    prob = om.Problem(reports=False)
+    prob.model.add_subsystem("prob_vars", ivc, promotes=["*"])
+    geom = om.Group()
+    geom.add_subsystem("mesh_ivc", om.IndepVarComp("mesh", val=mesh), promotes=["*"])
+    prob.model.add_subsystem("wing", geom)
+    prob.model.add_subsystem(
+        "aero", AeroPoint(surfaces=[surface]), promotes=["v", "alpha", "Mach_number", "re", "rho", "cg"]
+    )
+    prob.model.connect("wing.mesh", "aero.wing.def_mesh")
+    prob.model.connect("wing.mesh", "aero.aero_states.wing_def_mesh")
+
+    prob.setup()
+    prob.run_model()
+    return {
+        "CL": float(prob.get_val("aero.wing_perf.CL")[0]),
+        "CD": float(prob.get_val("aero.wing_perf.CD")[0]),
+        "S_ref": float(prob.get_val("aero.wing.S_ref")[0]),
+    }
+
+
+class TestOpenAeroStructCompatibility(unittest.TestCase):
+    """Our CSV-built mesh has to be a mesh OpenAeroStruct actually accepts.
+
+    The camber reconstruction is verified against ``generate_vsp_surfaces`` by
+    construction, but OpenVSP is not installed here, so the live comparison in
+    ``tests/geometry_tests/test_vsp_mesh.py`` is skipped. These checks close the
+    remaining gap from the other side: whatever the provenance, the mesh obeys
+    the conventions OAS's own generator produces, and the VLM solves on it.
+    """
+
+    def test_conventions_match_generate_mesh(self):
+        """Same chordwise and spanwise ordering as OAS's native generator."""
+        reference = generate_mesh(
+            {
+                "num_y": 15,
+                "num_x": 5,
+                "wing_type": "rect",
+                "symmetry": False,
+                "span": 10.0,
+                "root_chord": 1.0,
+                "span_cos_spacing": 0.0,
+                "offset": [-0.5, 0, 0],
+            }
+        )
+        for name in HALF_SPAN_IN:
+            with self.subTest(name=name):
+                ours = full_mesh(config.BASELINES[name])
+                for mesh in (reference, ours):
+                    # Leading edge at index 0, trailing edge at index -1.
+                    self.assertTrue(np.all(mesh[0, :, 0] < mesh[-1, :, 0]))
+                    # Spanwise runs from the most negative y to the most positive.
+                    self.assertTrue(np.all(np.diff(mesh[0, :, 1]) > 0))
+
+    def test_vlm_is_indifferent_to_handedness(self):
+        """OAS's two generators return opposite halves; the VLM accepts either.
+
+        ``generate_mesh(symmetry=True)`` returns the left half (y from -b/2 to 0)
+        while ``generate_vsp_surfaces`` -- and therefore ``half_mesh`` -- returns
+        the right half. This pins down that the difference does not matter, so
+        the right-half convention is safe to hand to a symmetric surface.
+        """
+        left = generate_mesh(
+            {
+                "num_y": 15,
+                "num_x": 5,
+                "wing_type": "rect",
+                "symmetry": True,
+                "span": 10.0,
+                "root_chord": 1.0,
+                "span_cos_spacing": 0.0,
+                "offset": [-0.5, 0, 0],
+            }
+        )
+        self.assertLess(left[0, 0, 1], 0.0)
+        self.assertAlmostEqual(left[0, -1, 1], 0.0, places=12)
+
+        result_left = _run_vlm(left, symmetry=True)
+        result_right = _run_vlm(_mirror(left), symmetry=True)
+        self.assertAlmostEqual(result_left["CL"], result_right["CL"], places=12)
+        self.assertAlmostEqual(result_left["CD"], result_right["CD"], places=12)
+
+    def test_half_with_symmetry_matches_full(self):
+        """The half mesh under symmetry gives the same answer as the full mesh.
+
+        This is the strongest statement available without OpenVSP: the mesh is
+        self-consistent under the join in ``full_mesh``, and OAS's symmetry
+        handling agrees with it.
+        """
+        for name in HALF_SPAN_IN:
+            with self.subTest(name=name):
+                half = _coarse_half(name)
+                full = np.hstack((_mirror(half)[:, :-1, :], half))
+
+                result_full = _run_vlm(full, symmetry=False)
+                result_half = _run_vlm(half, symmetry=True)
+
+                self.assertAlmostEqual(result_full["S_ref"], result_half["S_ref"], places=9)
+                np.testing.assert_allclose(result_half["CL"], result_full["CL"], rtol=1e-10)
+                np.testing.assert_allclose(result_half["CD"], result_full["CD"], rtol=1e-10)
+                # Sanity: a real wing at 3 deg, not a degenerate zero solution.
+                self.assertGreater(result_full["CL"], 0.1)
 
 
 if __name__ == "__main__":
