@@ -75,27 +75,45 @@ N_TWIST_CP = 5
 TWIST_BOUNDS = (-1.0, 5.0)  # deg
 
 SWEEP_B_BOUNDS = (0.0, 35.0)  # deg, leading-edge sweep of the tapered region
-TAPER_B_BOUNDS = (0.15, 1.0)  # tip/root chord ratio of the tapered region
+TAPER_B_BOUNDS = (0.05, 1.0)  # tip/root chord ratio of the tapered region
 
-# Rear-spar location as a fraction of chord. The aft wingbox must stay straight
-# (unswept). Both baselines already satisfy this: the unswept chord line sits at
-# 0.60 for Plan_L and ~0.68 for ConstChord.
+# Ceiling on cruise CL. In fixed_lift mode the wing area is free, so this is
+# what stops the optimizer shrinking the wing indefinitely: it sets a floor on
+# area of W / (q * MAX_CRUISE_CL). Do not try to free the area under fixed_cl
+# instead -- with CL pinned and area free, shrinking the wing shrinks the lift,
+# and the optimizer buys a lower CD by carrying less rather than by flying
+# better. That was measured, not assumed: it ran straight to the area floor.
+MAX_CRUISE_CL = 1.05
+
+# Location of the *straight* chord line, as a fraction of chord. This is the
+# line that has to stay unswept, and it is what sets region B's sweep. It is NOT
+# an edge of the structural box: measured off the Wingbox geom, it sits at 68.1%
+# (straight to 0.09 in) while the box's rear edge is a separate line at 74.2%
+# carrying 0.33 deg of sweep. The straight line lies inside the box.
 WINGBOX_CHORD_PCT_BOUNDS = (0.45, 0.75)
 
-# Front-spar location as a fraction of chord. Fixed, unlike the rear spar: it is
-# the rear spar that has to stay unswept, so only that one drives the planform.
-# The structural box is everything between the two, so its width is
-# (wingbox_pct - WINGBOX_FRONT_PCT) * chord, and the box spans 12.5% to 75% of
-# chord when the rear spar sits at its upper bound.
+# The structural box, as fractions of chord. Fixed, and independent of the
+# straight line above -- conflating the two is what previously made the width
+# constraint look infeasible. Measured as-built box: 12.5% to 74.2% of chord.
 WINGBOX_FRONT_PCT = 0.125
+WINGBOX_REAR_PCT = 0.75
 
-# Where the rear spar starts the optimization. The as-built VSP spars sit at
-# 0.60 (Plan_L) and 0.68 (ConstChord), which leaves a spar-to-spar box too
-# narrow for the inboard width requirement, so the design starts from the full
-# 12.5% -> 75% box instead of from the as-built geometry. The parameterization
-# still references the measured baseline, so the mesh at the measured spar
-# fraction is unchanged -- this moves the starting point, not the reference.
-WINGBOX_REAR_PCT_START = WINGBOX_CHORD_PCT_BOUNDS[1]
+# The rear spar is allowed to *kink*: it is a piecewise-linear schedule of
+# (y in inches, chord fraction) breakpoints rather than one number. Outside the
+# breakpoints the end values are held. A single breakpoint is the constant-
+# fraction spar the study ran until the wing 2 design point, and reproduces the
+# old behaviour exactly.
+#
+# Note this is the box's rear *edge*, not the straight sweep-driving line
+# (WINGBOX_CHORD_PCT_BOUNDS above). The two were decoupled deliberately; a
+# kinking rear edge does not make the sweep-driving line kink.
+WINGBOX_REAR_SCHEDULE = ((0.0, WINGBOX_REAR_PCT),)
+
+# Where the box width is required, as (y in inches, minimum width in inches).
+# The chord falls monotonically outboard, so on a constant-fraction box only the
+# outboard end of a run can bind; with a kinking rear spar every station named
+# here has to be checked on its own.
+WINGBOX_WIDTH_STATIONS = ((100.0, 65.0),)
 
 # ---------------------------------------------------------------------------
 # Region detection overrides

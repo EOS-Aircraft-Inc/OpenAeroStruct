@@ -25,10 +25,10 @@ Two formulations, switched with ``--mode``:
     wing. It is also the formulation that runs today, with no extra data needed.
 
 ``fixed_lift``
-    Minimize *drag force* with *lift force* pinned to the cruise weight, and no
-    area constraint. This is the physically correct way to let the area trade,
-    and it is what should be used as soon as a cruise weight is available: pass
-    ``--weight <newtons>``.
+    Minimize *drag force* with *lift force* pinned to the cruise weight, and the
+    area free above a floor set by ``config.MAX_CRUISE_CL``. This is the
+    physically correct way to let the area trade, and it is what should be used
+    as soon as a cruise weight is available: pass ``--weight <newtons>``.
 
 Read the S_ref/taper warning printed by ``report_area_coupling`` before
 believing a ``fixed_cl`` result: for the ConstChord geometry, the area is a
@@ -54,7 +54,6 @@ from openaerostruct.aerodynamics.aero_groups import AeroPoint
 from studies.vsp_planform import config
 from studies.vsp_planform.mesh import N_CHORDWISE, half_mesh, resample, spanwise_stations
 from studies.vsp_planform.param import (
-    WINGBOX_WIDTH_MIN_IN,
     baseline_planform,
     build_geometry_group,
     build_surface,
@@ -88,8 +87,15 @@ def load_baseline(name, n_spanwise=None, nx=None):
     return mesh, stick, regions, planform0, residual, mesh_native
 
 
-def build_problem(name, mesh, stick, regions, planform0):
-    """Flight conditions -> geometry -> AeroPoint, plus dimensional lift/drag."""
+def build_problem(name, mesh, stick, regions, planform0, extra=None):
+    """Flight conditions -> geometry -> AeroPoint, plus dimensional lift/drag.
+
+    ``extra`` is an optional ``f(model, mesh, regions)`` called just before
+    ``setup()``. OpenMDAO refuses ``add_subsystem`` on an already-set-up model,
+    so a study that needs its own component -- the region-B twist monotonicity
+    constraint, for one -- has no way in without this hook. It is deliberately
+    the last thing before setup, so anything it adds sees the finished model.
+    """
     surface = build_surface(mesh, stick, regions)
 
     prob = om.Problem(reports=False)
@@ -113,7 +119,7 @@ def build_problem(name, mesh, stick, regions, planform0):
     prob.model.add_subsystem(
         "wing",
         build_geometry_group(surface, regions, planform0),
-        promotes_outputs=["sweep_B", "wingbox_width", "twist_abs"],
+        promotes_outputs=["sweep_B", "station_chord", "wingbox_width", "twist_abs"],
     )
     prob.model.add_subsystem(
         POINT,
@@ -147,6 +153,9 @@ def build_problem(name, mesh, stick, regions, planform0):
     prob.model.connect(f"{POINT}.wing_perf.CL", "forces.CL")
     prob.model.connect(f"{POINT}.wing_perf.CD", "forces.CD")
 
+    if extra is not None:
+        extra(prob.model, mesh, regions)
+
     prob.setup()
     return prob, surface
 
@@ -174,11 +183,14 @@ def add_optimization(prob, name, mesh, planform0, s_ref0, mode="fixed_cl", weigh
     )
 
     if name == "plan_l":
-        # Inboard wingbox must stay at least 65 in wide out to y = 100 in. The
-        # width comes out of the geometry in metres; the requirement is in
-        # inches, so it is scaled here rather than anywhere near the mesh.
-        width_min = WINGBOX_WIDTH_MIN_IN * config.SCALE
-        model.add_constraint("wingbox_width", lower=width_min, units="m", ref=width_min)
+        # The wingbox must stay at least as wide as required at every station in
+        # config.WINGBOX_WIDTH_STATIONS -- 65 in out to y = 100 in on the stock
+        # settings, more stations once the rear spar kinks. The width comes out
+        # of the geometry in metres; the requirements are in inches, so they are
+        # scaled here rather than anywhere near the mesh. One `ref` has to serve
+        # the whole vector, so it is the mean requirement.
+        width_min = np.array([w for _, w in config.WINGBOX_WIDTH_STATIONS], dtype=float) * config.SCALE
+        model.add_constraint("wingbox_width", lower=width_min, units="m", ref=float(np.mean(width_min)))
 
     # Every constraint is normalized to O(1) with `ref`. SLSQP works on the
     # scaled problem and merges all constraints into one tolerance test, so an
@@ -193,6 +205,24 @@ def add_optimization(prob, name, mesh, planform0, s_ref0, mode="fixed_cl", weigh
         if weight is None:
             raise ValueError("fixed_lift mode needs a cruise weight in newtons (--weight)")
         model.add_constraint("lift", equals=weight, ref=weight)
+        # Size the wing by the cruise-CL limit instead of leaving area free.
+        # Span is not a design variable, so at fixed lift the induced drag does
+        # not respond to area at all and only profile drag does -- so on its own,
+        # area is a one-way trade that runs to whatever floor a constraint
+        # provides. That was measured: with only a CL ceiling, Plan_L stopped at
+        # 74.1947 m^2 against a floor of 74.1948.
+        #
+        # This is a FLOOR, not an equality. An earlier version pinned it, on the
+        # grounds that the optimizer ran to the floor anyway so the two were
+        # equivalent and the equality said so more honestly. That equivalence
+        # held only while nothing in the problem pushed area *up*. The wingbox
+        # width constraints do: meeting a 25 in box at the winglet junction takes
+        # a 66 in junction chord, which costs area. Against an equality that is
+        # simply infeasible; against a floor the optimizer buys the area it needs
+        # and the cruise CL falls out as a result worth reporting.
+        q = 0.5 * config.RHO * config.V_MS**2
+        s_ref_sized = weight / (q * config.MAX_CRUISE_CL)
+        model.add_constraint(f"{POINT}.wing.S_ref", lower=s_ref_sized, ref=s_ref_sized)
         model.add_objective("drag", ref=1.0e4)
     else:
         raise ValueError(f"unknown mode {mode!r}")
@@ -271,6 +301,8 @@ def report_area_coupling(name, prob, planform0):
 
 
 def _state(prob):
+    widths = prob.get_val("wingbox_width", units="m") / config.SCALE
+    required = np.array([w for _, w in config.WINGBOX_WIDTH_STATIONS], dtype=float)
     return {
         "CL": float(prob.get_val(f"{POINT}.wing_perf.CL")[0]),
         "CD": float(prob.get_val(f"{POINT}.wing_perf.CD")[0]),
@@ -281,7 +313,9 @@ def _state(prob):
         "wingbox_pct": float(prob.get_val("wing.wingbox_pct")[0]),
         "taper_B": float(prob.get_val("wing.taper_B")[0]),
         "sweep_B": float(prob.get_val("sweep_B", units="deg")[0]),
-        "wingbox_width_in": float(prob.get_val("wingbox_width", units="m")[0] / config.SCALE),
+        "wingbox_width_in": widths,
+        # One number for the table: how much slack the tightest station has left.
+        "wingbox_margin_in": float(np.min(widths - required)),
         "twist_root": float(prob.get_val("twist_abs", units="deg")[0]),
         "twist_tip": float(prob.get_val("twist_abs", units="deg")[-1]),
         "twist_cp": prob.get_val("wing.twist_cp", units="deg").copy(),
@@ -298,7 +332,7 @@ ROWS = [
     ("wingbox_pct", "{:.5f}"),
     ("taper_B", "{:.5f}"),
     ("sweep_B", "{:.4f}"),
-    ("wingbox_width_in", "{:.2f}"),
+    ("wingbox_margin_in", "{:+.2f}"),
     ("twist_root", "{:+.4f}"),
     ("twist_tip", "{:+.4f}"),
 ]
@@ -346,11 +380,19 @@ def run_one(name, mode="fixed_cl", weight=None, n_spanwise=None, nx=None):
     prob, _ = build_problem(name, mesh, stick, regions, planform0)
 
     # Trim the baseline to the same lift the optimizer will be held to, so the
-    # CD comparison is like for like.
-    alpha_trim = trim_alpha(prob, config.CL_TARGET)
+    # comparison is like for like. Under fixed_lift that means the CL which puts
+    # `weight` on the *baseline* area -- trimming to CL_TARGET instead would
+    # compare a 211 kN baseline against a 383 kN optimum.
+    if mode == "fixed_lift":
+        prob.run_model()
+        q = 0.5 * config.RHO * config.V_MS**2
+        cl_baseline = weight / (q * float(prob.get_val(f"{POINT}.wing.S_ref")[0]))
+    else:
+        cl_baseline = config.CL_TARGET
+    alpha_trim = trim_alpha(prob, cl_baseline)
     baseline = _state(prob)
     s_ref0 = baseline["S_ref"]
-    print(f"  baseline trimmed to CL = {config.CL_TARGET} at alpha = {alpha_trim:+.4f} deg")
+    print(f"  baseline trimmed to CL = {cl_baseline:.4f} at alpha = {alpha_trim:+.4f} deg")
     print(
         f"  baseline twist {baseline['twist_root']:+.3f} -> {baseline['twist_tip']:+.3f} deg, S_ref = {s_ref0:.4f} m^2"
     )
@@ -359,11 +401,6 @@ def run_one(name, mode="fixed_cl", weight=None, n_spanwise=None, nx=None):
     add_optimization(prob, name, mesh, planform0, s_ref0, mode=mode, weight=weight)
     # setup() reset the model, so start the optimizer from the trimmed baseline.
     prob.set_val("alpha", alpha_trim, units="deg")
-    # Open the wingbox to its full 12.5% -> 75% extent before the first
-    # iteration. At the as-built spar fraction the spar-to-spar box is narrower
-    # than the inboard width requirement, so starting there would hand the
-    # optimizer an infeasible point.
-    prob.set_val("wing.wingbox_pct", config.WINGBOX_REAR_PCT_START)
     prob.run_model()
     prob.run_driver()
 

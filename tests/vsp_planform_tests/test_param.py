@@ -23,6 +23,8 @@ from studies.vsp_planform.param import (
     baseline_wingbox_pct,
     build_geometry_group,
     build_surface,
+    rear_spar_fraction,
+    reloft_region_a,
     twist_cp_bounds,
 )
 from studies.vsp_planform.regions import Regions
@@ -339,6 +341,274 @@ class TestPlanformMap(unittest.TestCase):
         z_ref_new = 0.25 * mesh_new[-1, :, 2] + 0.75 * mesh_new[0, :, 2]
         np.testing.assert_allclose(z_ref_new, z_ref_old, atol=1e-12)
         np.testing.assert_allclose(mesh_new[:, :, 1], self.mesh[:, :, 1], atol=1e-12)
+
+
+class TestRearSparSchedule(unittest.TestCase):
+    """The rear spar is a spanwise schedule, so it can kink."""
+
+    # The wing 2 design point: constant 0.75c inboard, kinking forward to 0.499c
+    # at the winglet junction.
+    SCHEDULE = ((356.0, 0.750), (674.9, 0.499))
+
+    def test_constant_schedule_is_the_old_single_fraction(self):
+        np.testing.assert_allclose(rear_spar_fraction([0.0, 100.0, 700.0], ((0.0, 0.75),)), 0.75)
+
+    def test_breakpoints_are_hit_exactly_and_held_outside(self):
+        y = np.array([0.0, 176.0, 356.0, 674.9, 708.0])
+        rear = rear_spar_fraction(y, self.SCHEDULE)
+        # Flat inboard of the first knot and outboard of the last.
+        np.testing.assert_allclose(rear[:3], 0.750)
+        np.testing.assert_allclose(rear[3:], 0.499)
+
+    def test_kink_is_linear_in_span(self):
+        y_mid = 0.5 * (356.0 + 674.9)
+        self.assertAlmostEqual(
+            float(rear_spar_fraction(y_mid, self.SCHEDULE)), 0.5 * (0.750 + 0.499), places=12
+        )
+
+    def test_unsorted_breakpoints_are_accepted(self):
+        shuffled = tuple(reversed(self.SCHEDULE))
+        np.testing.assert_allclose(
+            rear_spar_fraction([0.0, 500.0, 700.0], shuffled),
+            rear_spar_fraction([0.0, 500.0, 700.0], self.SCHEDULE),
+        )
+
+    def test_bad_schedule_shape_is_rejected(self):
+        with self.assertRaises(ValueError):
+            rear_spar_fraction(0.0, (0.75, 0.5))
+
+
+class TestWidthStations(unittest.TestCase):
+    """``wingbox_width`` is a vector over the constraint stations."""
+
+    def setUp(self):
+        self.stick = synthetic_stick()
+        self.regions = synthetic_regions(self.stick)
+        self.mesh = synthetic_mesh()
+        self.p0 = baseline_planform(self.stick, self.regions, rule="root_le_fixed")
+
+    def _run(self, **kwargs):
+        prob = om.Problem(reports=False)
+        prob.model.add_subsystem(
+            "comp", _planform_comp(self.mesh, self.regions, self.p0, **kwargs), promotes=["*"]
+        )
+        prob.setup(force_alloc_complex=True)
+        return prob
+
+    def test_width_is_one_entry_per_station(self):
+        prob = self._run(
+            width_t=np.array([0.0, 0.3, 1.0]),
+            width_c0=np.array([2.0, 1.5, 1.0]),
+            front_pct=0.125,
+            rear_pct=np.array([0.75, 0.70, 0.499]),
+        )
+        prob.run_model()
+        chord = prob.get_val("station_chord")
+        width = prob.get_val("wingbox_width")
+        self.assertEqual(width.shape, (3,))
+        # width = (rear - front) * chord, station by station.
+        np.testing.assert_allclose(width, (np.array([0.75, 0.70, 0.499]) - 0.125) * chord, rtol=1e-12)
+
+    def test_kinked_rear_spar_narrows_the_box_outboard(self):
+        """A forward-kinking rear spar must cut the outboard box, not the inboard."""
+        straight = self._run(
+            width_t=np.array([0.0, 1.0]), width_c0=np.array([2.0, 1.0]), front_pct=0.125, rear_pct=0.75
+        )
+        straight.run_model()
+        kinked = self._run(
+            width_t=np.array([0.0, 1.0]),
+            width_c0=np.array([2.0, 1.0]),
+            front_pct=0.125,
+            rear_pct=np.array([0.75, 0.499]),
+        )
+        kinked.run_model()
+
+        w_straight = straight.get_val("wingbox_width")
+        w_kinked = kinked.get_val("wingbox_width")
+        self.assertAlmostEqual(w_kinked[0], w_straight[0], places=12)
+        self.assertLess(w_kinked[1], w_straight[1])
+        # The chord itself is untouched: the schedule moves an edge of the box,
+        # not the planform.
+        np.testing.assert_allclose(kinked.get_val("station_chord"), straight.get_val("station_chord"), rtol=1e-12)
+
+    def test_partials_with_vector_stations(self):
+        for rule in ("preserved", "root_le_fixed"):
+            with self.subTest(rule=rule):
+                p0 = baseline_planform(self.stick, self.regions, rule=rule)
+                prob = om.Problem(reports=False)
+                prob.model.add_subsystem(
+                    "comp",
+                    _planform_comp(
+                        self.mesh,
+                        self.regions,
+                        p0,
+                        width_t=np.array([0.0, 0.3, 1.0]),
+                        width_c0=np.array([2.0, 1.5, 1.0]),
+                        front_pct=0.125,
+                        rear_pct=np.array([0.75, 0.70, 0.499]),
+                    ),
+                    promotes=["*"],
+                )
+                prob.setup(force_alloc_complex=True)
+                prob.set_val("taper_B", 0.31)
+                prob.set_val("wingbox_pct", 0.61)
+                prob.run_model()
+                data = prob.check_partials(method="cs", compact_print=True, out_stream=None)
+                assert_check_partials(data, atol=1e-9, rtol=1e-9)
+
+    def test_geometry_group_samples_the_schedule(self):
+        """The group turns (stations, schedule) into the per-station rear edge."""
+        surface = build_surface(self.mesh, self.stick, self.regions)
+        stations = [100.0, 361.7, 674.95]
+        schedule = ((361.7, 0.75), (674.95, 0.499))
+
+        prob = om.Problem(reports=False)
+        prob.model.add_subsystem(
+            "wing",
+            build_geometry_group(
+                surface, self.regions, self.p0, width_stations=stations, rear_schedule=schedule
+            ),
+            promotes=["*"],
+        )
+        prob.setup()
+        prob.run_model()
+
+        chord = prob.get_val("station_chord", units="m")
+        width = prob.get_val("wingbox_width", units="m")
+        rear = rear_spar_fraction(stations, schedule)
+        np.testing.assert_allclose(width, (rear - 0.125) * chord, rtol=1e-12)
+        # Baseline design vector, so the chords are the mesh's own.
+        y_abs = np.abs(self.mesh[0, :, 1])
+        cx0 = self.mesh[-1, :, 0] - self.mesh[0, :, 0]
+        np.testing.assert_allclose(chord, np.interp(np.array(stations) * SCALE, y_abs, cx0), rtol=1e-12)
+
+
+class TestRelofting(unittest.TestCase):
+    """Moving the A|B breakpoint by rebuilding the chord distribution."""
+
+    def setUp(self):
+        self.stick = synthetic_stick()
+        self.regions = synthetic_regions(self.stick)
+        self.mesh = synthetic_mesh()
+        self.p0 = baseline_planform(self.stick, self.regions, rule="root_le_fixed")
+
+    @staticmethod
+    def _chord_at(mesh, y_in):
+        y = np.abs(mesh[0, :, 1])
+        return np.interp(np.asarray(y_in) * SCALE, y, mesh[-1, :, 0] - mesh[0, :, 0]) / SCALE
+
+    def test_same_breakpoint_is_the_identity(self):
+        """Asking for the breakpoint the baseline already has must change nothing."""
+        mesh, stick, regions = reloft_region_a(self.mesh, self.stick, self.regions, Y_A, self.p0)
+        np.testing.assert_allclose(mesh, self.mesh, atol=1e-12)
+        np.testing.assert_allclose(stick.le, self.stick.le, atol=1e-10)
+        np.testing.assert_allclose(stick.te, self.stick.te, atol=1e-10)
+        self.assertEqual(regions.as_tuple(), self.regions.as_tuple())
+
+    def test_region_a_and_the_winglet_are_untouched(self):
+        y_new = 176.0
+        mesh, stick, regions = reloft_region_a(self.mesh, self.stick, self.regions, y_new, self.p0)
+        y = np.abs(self.mesh[0, :, 1]) / SCALE
+        outside = (y <= regions.y_a_end) | (y >= Y_C)
+        np.testing.assert_allclose(mesh[:, outside, :], self.mesh[:, outside, :], atol=1e-12)
+
+    def test_region_b_becomes_a_straight_taper_from_the_new_breakpoint(self):
+        y_new = 176.0
+        mesh, stick, regions = reloft_region_a(self.mesh, self.stick, self.regions, y_new, self.p0)
+        y_a = regions.y_a_end
+
+        stations = np.linspace(y_a, Y_C, 9)
+        chord = self._chord_at(mesh, stations)
+        # Linear in y between the breakpoint chord and the junction chord.
+        expected = np.linspace(chord[0], chord[-1], 9)
+        np.testing.assert_allclose(chord, expected, rtol=1e-9)
+
+        # And it is a taper, not the bulge the un-relofted map produces: the
+        # chord must fall monotonically from the breakpoint outboard.
+        self.assertTrue(np.all(np.diff(chord) < 0.0))
+        self.assertLess(chord[-1], chord[0])
+
+    def test_the_baseline_spar_line_is_preserved(self):
+        """The re-loft moves the leading edge along the baseline's own spar."""
+        mesh, stick, regions = reloft_region_a(self.mesh, self.stick, self.regions, 176.0, self.p0)
+        p = self.p0["wingbox_pct"]
+
+        def spar(m):
+            le, te = m[0, :, 0], m[-1, :, 0]
+            return le + p * (te - le)
+
+        np.testing.assert_allclose(spar(mesh), spar(self.mesh), atol=1e-12)
+
+    def test_twist_is_carried_through(self):
+        mesh, _, _ = reloft_region_a(self.mesh, self.stick, self.regions, 176.0, self.p0)
+        np.testing.assert_allclose(baseline_twist(mesh), baseline_twist(self.mesh), atol=1e-10)
+
+    def test_span_and_dihedral_are_frozen(self):
+        mesh, _, _ = reloft_region_a(self.mesh, self.stick, self.regions, 176.0, self.p0)
+        np.testing.assert_allclose(mesh[:, :, 1], self.mesh[:, :, 1], atol=1e-12)
+        # The quarter-chord z line is the dihedral, and nothing here may move it.
+        def ref_z(m):
+            return 0.75 * m[0, :, 2] + 0.25 * m[-1, :, 2]
+
+        np.testing.assert_allclose(ref_z(mesh), ref_z(self.mesh), atol=1e-12)
+
+    def test_matches_the_oas_transform_chain(self):
+        """The hand-rolled ScaleX/ShearX must equal what MeshTransforms does."""
+        from openaerostruct.geometry.geometry_mesh_transformations import ScaleX, ShearX
+
+        from studies.vsp_planform.param import _reloft_factor
+
+        y_new = 176.0
+        mesh, _, regions = reloft_region_a(self.mesh, self.stick, self.regions, y_new, self.p0)
+
+        y_s = np.abs(self.stick.le[:, 1])
+        cx_s = self.stick.te[:, 0] - self.stick.le[:, 0]
+        f = _reloft_factor(np.abs(self.mesh[0, :, 1]) / SCALE, regions.y_a_end, Y_C, y_s, cx_s)
+        cx0 = self.mesh[-1, :, 0] - self.mesh[0, :, 0]
+        p = self.p0["wingbox_pct"]
+
+        ny = self.mesh.shape[1]
+        prob = om.Problem(reports=False)
+        prob.model.add_subsystem(
+            "scale", ScaleX(val=np.ones(ny), mesh_shape=self.mesh.shape, ref_axis_pos=0.25), promotes=["*"]
+        )
+        prob.model.add_subsystem("shear", ShearX(val=np.zeros(ny), mesh_shape=self.mesh.shape), promotes=["xshear"])
+        prob.model.connect("mesh", "shear.in_mesh")
+        prob.setup()
+        prob.set_val("in_mesh", self.mesh, units="m")
+        prob.set_val("chord", f)
+        prob.set_val("xshear", (p - 0.25) * cx0 * (1.0 - f), units="m")
+        prob.run_model()
+
+        np.testing.assert_allclose(mesh, prob.get_val("shear.mesh", units="m"), atol=1e-12)
+
+    def test_relofted_baseline_still_round_trips_through_the_geometry_group(self):
+        """The re-lofted mesh is a baseline like any other: identity at its own DVs."""
+        mesh, stick, regions = reloft_region_a(self.mesh, self.stick, self.regions, 176.0, self.p0)
+        planform0 = baseline_planform(stick, regions, rule="root_le_fixed")
+        surface = build_surface(mesh, stick, regions)
+
+        prob = om.Problem(reports=False)
+        prob.model.add_subsystem(
+            "wing", build_geometry_group(surface, regions, planform0), promotes=["*"]
+        )
+        prob.setup()
+        prob.run_model()
+        np.testing.assert_allclose(prob.get_val("mesh", units="m"), mesh, atol=1e-12)
+
+    def test_measured_taper_matches_the_rebuilt_geometry(self):
+        """baseline_planform must read the re-lofted wing, not the original."""
+        mesh, stick, regions = reloft_region_a(self.mesh, self.stick, self.regions, 176.0, self.p0)
+        planform0 = baseline_planform(stick, regions, rule="root_le_fixed")
+
+        chord = self._chord_at(mesh, [regions.y_a_end, Y_C])
+        self.assertAlmostEqual(planform0["taper_B"], chord[1] / chord[0], places=8)
+        # Region B is now a genuinely straight taper, so its spar fit is exact.
+        self.assertLess(planform0["spar_max_dev"], 1e-9 * C_ROOT)
+
+    def test_breakpoint_outboard_of_the_junction_is_rejected(self):
+        with self.assertRaises(ValueError):
+            reloft_region_a(self.mesh, self.stick, self.regions, Y_TIP, self.p0)
 
 
 class TestSurfaceDict(unittest.TestCase):
