@@ -513,6 +513,97 @@ constraint you expect to bite actually changed the design vector. (Adding a
 *component* has the opposite problem — OpenMDAO refuses `add_subsystem` after
 setup, which is what `build_problem(..., extra=)` exists for.)
 
+### WING 5 — thickness, priced by the structural tool
+
+Wing 5 is **wing 3's planform with t/c raised inboard only**. `S_ref`, `wingbox_pct`
+and `CL` match wing 3 to five decimals; the root goes 0.177 → 0.214 and blends back
+to the as-built loft by y = 447 in. Nothing else changes.
+
+| at MTOW | wing 3 | wing 5 |
+|---|---|---|
+| drag | 10463.9 N | **10579.2 N** (+1.10%) |
+| induced | 7064.15 N | 7064.15 N (identical) |
+| viscous | 3399.78 N | 3515.06 N (**the entire delta**) |
+| S_ref | 77.093 m² | 77.093 m² |
+| t/c root | 0.1770 | 0.2143 |
+| wing weight | 8613.9 lb | **8032.5 lb (−581)** |
+| electric range | 328.1 nmi | **336.5 nmi (+2.57%)** |
+
+Weight is from WingCalc sizing the OAS geometry, 20 bays closed. Range assumes wing
+weight trades against battery at fixed MTOW, 300 Wh/kg, η = 0.80. Drag is at MTOW;
+the weight and range columns are from the coupled runs at cruise weight — see
+`out/logs/wing5.json` and `wing5_design_point.json`.
+
+**This is the first case in this study whose merit is not drag.** It is *worse* on
+every aero metric and better overall, which is only visible because the structural
+tool is in the loop.
+
+#### Why thickness, and why only inboard
+
+At fixed t/c, `depth = retention · t/c · chord`, so every inch of chord taken for
+drag is box depth taken from the structure. That is why ConstChord (105 in root)
+sizes ~600 lb heavier than Plan L (138.9 in) at comparable t/c. Drag and structure
+were fighting over one variable; opening t/c gives them separate ones.
+
+Sweeping t/c uniformly, root 0.150 → 0.200: wing weight moves **28%** (9785 → 7659 lb)
+while drag moves **3%**. The exchange rate is **4–7 lb of structure per newton**, so at
+300 Wh/kg every newton saved by thinning costs more battery than the drag is worth.
+Range keeps improving to root t/c ≈ **0.23** and is flat to 0.25; the 0.22 cap gives
++2.81% of a +2.99% ceiling, so staying inside conventional thickness is nearly free.
+
+Thinning also *grows* the wing: `c_req = 6 in/(retention · t/c)` rose 55.98 → 65.86 in
+at scale 0.85, taking `S_ref` to 79.18 m². A drag-only optimizer takes that trade
+happily — it picks the thinnest wing in the sweep — while adding 1345 lb it cannot see.
+
+Decomposing a uniform thickening bay by bay, each bay's battery gain against its
+share of the drag cost, the two cross at **y = 447 in (63% semi-span)**: structural
+benefit falls ~40× root to tip with bending moment, drag cost only ~2.5× with chord.
+Wing 5 stops there. It gets **no** area relief (`c_req` and `S_ref` are wing 3's), so
+its +2.57% is thickness alone — most of the uniform gain was structural, not area.
+
+**Caveats.** Root t/c 0.214 extrapolates the Raymer form factor past where it is
+calibrated, and the section is the as-built one *scaled*, not designed — OAS reduces
+a section to t/c and `c_max_t`, so it cannot tell a good 21% section from a bad one.
+The drag side is the weak half of this trade. The spanwise crossover assumes bay
+separability, and loads pass inboard, so it is a good estimate rather than exact.
+
+#### The ~1000 lb the aircraft weight book is missing
+
+The mass export carries `Wing structure total = 7460 lb`. WingCalc sizes the same
+constant-chord wing at **8469 lb**, and an independent run of ours agrees to 0.8%.
+That gap is ~1.2% of MTOW and it is not a tool disagreement — **wing 3 is too thin
+inboard**. At root t/c 0.22 the sized wing is 7604 lb and the gap all but closes.
+
+### Coupling OpenAeroStruct to WingCalc
+
+`studies/vsp_planform/coupling/` — `geometry.py` writes the OpenVSP station export
+WingCalc's provider reads (chord and t/c round-trip to 4+ digits), `deck.py` builds
+and sizes a deck, `mission.py` holds the weight/battery/range bookkeeping.
+Cross-validated against an independent WingCalc run of the same wing: 20 bays
+closed, wing weight within **0.8%**.
+
+Architecture is **bi-level**, not monolithic: OAS optimizes the planform with wing
+weight frozen, WingCalc re-sizes, repeat. Measured loop gain is **−0.03** — a heavier
+wing relieves its own bending — so it converges in 2–4 passes. A single evaluation
+is 0.3 s but bay sizing is ~180 s over ~143k trials of integer ply counts, so the
+sizer has no business inside a gradient loop.
+
+**A fixed-point loop converges quantities, not gradients.** Cruise weight is a
+consistency quantity and the loop handles it. Thickness is a *trade*, so it cannot:
+weight crosses the boundary as one scalar, and steering t/c needs `∂W/∂(t/c)`. That
+is why wing 5 came from a sweep and not from the optimizer, and why making t/c a
+design variable needs a weight surrogate inside the model first.
+
+**Deck traps, each of which produced a wrong answer before being found.** The ply
+bounds in `opti_inputs.csv` govern: at 6–60/50/40 the inboard bays cannot close on
+this geometry (11 of 13 groups pinned at their maxima, margin −0.165); the reference
+deck allows 6–100 and closes. `Fwd spar X at BL0` must NOT be rewritten from the OAS
+mesh — the fwd spar is the fixed point the LE/TE move around, and "correcting" it
+translated the wing 49 in against the gear and cg stations. `optimize_bay` does not
+read `wingSizingIn.csv`; it seeds from `optiObBay.csv`. And WingCalc takes a single
+scalar aft-spar ratio, so the 0.750 → 0.550 kink cannot be represented — 0.750 is
+used, correct inboard where the binding bays are.
+
 ### ~~The as-built section is better than any replacement found~~ — RETRACTED
 
 **This claim was an artifact of a broken feasibility screen. It does not survive
