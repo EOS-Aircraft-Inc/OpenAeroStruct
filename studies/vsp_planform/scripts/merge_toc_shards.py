@@ -4,7 +4,8 @@ from pathlib import Path
 
 LOGS = Path(__file__).resolve().parent.parent / "out" / "logs"
 res = []
-for f in sorted(LOGS.glob("coupled_toc_profile_shard*.json")):
+# --tag rows (r210, r230) are named by tag, not by shard index
+for f in sorted(LOGS.glob("coupled_toc_profile_*.json")):
     res.extend(json.loads(f.read_text()))
 res.sort(key=lambda r: (r["root_toc"], r["ratio"]))
 (LOGS / "coupled_toc_profile.json").write_text(json.dumps(res, indent=2))

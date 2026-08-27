@@ -148,12 +148,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--nshards", type=int, default=1)
+    # --roots / --ratios override the grid, so extra rows can be added to a run
+    # already in flight without disturbing it; --tag names the output file.
+    ap.add_argument("--roots", type=str, default=None, help="comma-separated root t/c")
+    ap.add_argument("--ratios", type=str, default=None, help="comma-separated tip/root")
+    ap.add_argument("--tag", type=str, default=None, help="output file suffix")
     args = ap.parse_args()
 
-    points = [(root, ratio) for root in ROOT_TOCS for ratio in TIP_RATIOS]
+    roots = [float(v) for v in args.roots.split(",")] if args.roots else ROOT_TOCS
+    ratios = [float(v) for v in args.ratios.split(",")] if args.ratios else TIP_RATIOS
+    points = [(root, ratio) for root in roots for ratio in ratios]
     mine = [pt for i, pt in enumerate(points) if i % args.nshards == args.shard]
-    out = (OUT if args.nshards == 1
-           else OUT.with_name(f"{OUT.stem}_shard{args.shard}{OUT.suffix}"))
+    suffix = args.tag if args.tag else f"shard{args.shard}"
+    out = (OUT if (args.nshards == 1 and not args.tag)
+           else OUT.with_name(f"{OUT.stem}_{suffix}{OUT.suffix}"))
     print(f"shard {args.shard}/{args.nshards}: {len(mine)} of {len(points)} points "
           f"-> {out.name}", flush=True)
 
@@ -170,7 +178,7 @@ def main():
               f"| W_wing {r['w_wing_lb']:.1f} lb | R {r['R_nmi']:.1f} nmi", flush=True)
         out.write_text(json.dumps(res, indent=2))
 
-    if args.nshards > 1:      # the merge and the table belong to the whole grid
+    if args.nshards > 1 or args.tag:   # the merge owns the whole grid
         return
 
     base = res[0]

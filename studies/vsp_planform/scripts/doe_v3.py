@@ -22,6 +22,7 @@ pattern from the spar-kink calc, applied per-section.
 Box requirement is 20 in (user, 2026-08-15), down from the 25 in placeholder.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -35,7 +36,12 @@ from studies.vsp_planform.degen_csv import read_degen_csv  # noqa: E402
 
 AL = np.arange(-6, 20.05, 0.5)
 CL_OP = 0.93
-DEPTH = 7.0
+# Aft-spar depth required at the binding station, inches. The study ran this
+# screen at 7 in, which was the wing 2 requirement at the winglet junction. The
+# adopted design puts the ailerons at 90% semi-span and requires 6 in there
+# (aileron_90.py, depth_feasibility.py), so 6.0 is the current number and 7.0 is
+# kept reachable for comparison with the published table.
+DEPTH = float(os.environ.get("DOE_DEPTH_IN", "6.0"))
 BOX = 20.0
 FMIN = 0.12
 AMAX = 0.75
@@ -147,8 +153,22 @@ def evaluate(af):
 if __name__ == "__main__":
     rows = []
     manual = {}
-    for nm, p in (("as-built", None), ("S6", "S6_airfoil"), ("S7", "S7_airfoil"), ("S9", "S9_airfoil"), ("S11", "S11_airfoil")):
-        af = asbuilt() if p is None else selig(f"/mnt/c/Users/AlexanderAmos/Downloads/{p}.dat")
+    # The manual sections are read from a local download directory that is not
+    # part of the repository. A missing one must not take the database screen
+    # down with it -- the as-built comes from the committed DegenGeom and always
+    # loads.
+    manual_dir = Path(os.environ.get("MANUAL_AIRFOIL_DIR",
+                                     "/mnt/c/Users/AlexanderAmos/Downloads"))
+    for nm, p in (("as-built", None), ("S6", "S6_airfoil"), ("S7", "S7_airfoil"),
+                  ("S9", "S9_airfoil"), ("S11", "S11_airfoil")):
+        if p is None:
+            af = asbuilt()
+        else:
+            src = manual_dir / f"{p}.dat"
+            if not src.exists():
+                print(f"  NOTE: manual section {nm} not found at {src} -- skipped")
+                continue
+            af = selig(str(src))
         af.name = nm
         r = evaluate(af)
         if r:
@@ -159,7 +179,7 @@ if __name__ == "__main__":
 
     root = Path(asb.__file__).parent / "geometry" / "airfoil" / "airfoil_database"
     names = sorted(x.stem for x in root.glob("*.dat"))
-    print(f"screening {len(names)} database sections ({DEPTH:.0f} in depth, {BOX:.0f} in box, spar scanned {FMIN}-{AMAX})...")
+    print(f"screening {len(names)} database sections ({DEPTH:.1f} in depth, {BOX:.0f} in box, spar scanned {FMIN}-{AMAX})...")
     for n in names:
         try:
             r = evaluate(asb.Airfoil(n))
