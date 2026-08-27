@@ -7,7 +7,7 @@ thickness and where it sits. Objective is L/D at the wing's operating Cl.
 """
 import sys, numpy as np
 from pathlib import Path
-sys.path.insert(0,"/home/alex/repos/OpenAeroStruct")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[3]))
 import aerosandbox as asb
 from studies.vsp_planform import config
 from studies.vsp_planform.degen_csv import read_degen_csv

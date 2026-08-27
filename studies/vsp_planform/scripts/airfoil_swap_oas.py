@@ -23,7 +23,7 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, "/home/alex/repos/OpenAeroStruct")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[3]))
 
 from studies.vsp_planform import config, param
 

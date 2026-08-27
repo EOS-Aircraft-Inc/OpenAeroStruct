@@ -1,7 +1,8 @@
 """2D section results (NeuralFoil) for the candidate airfoils."""
+import os
 import sys, numpy as np, matplotlib
 matplotlib.use("Agg"); import matplotlib.pyplot as plt
-sys.path.insert(0,"/home/alex/repos/OpenAeroStruct")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[3]))
 import aerosandbox as asb
 from studies.vsp_planform import config
 
@@ -40,5 +41,5 @@ ax[1,0].set(title="section L/D",xlabel="$C_l$",ylabel="$C_l/C_d$")
 ax[1,1].set(title="pitching moment",xlabel="$C_l$",ylabel="$C_m$"); ax[1,1].axhline(0,color='0.85',lw=.8)
 for a in ax.ravel(): a.grid(alpha=.25); a.legend(fontsize=8)
 fig.tight_layout(rect=(0,0,1,.95))
-p="/home/alex/repos/OpenAeroStruct/studies/vsp_planform/out/figures/section_2d_results.png"
+p=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),"out","figures","section_2d_results.png")
 fig.savefig(p,dpi=130); print("\n"+p)

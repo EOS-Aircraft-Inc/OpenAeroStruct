@@ -1,7 +1,8 @@
 """Best ConstChord case: planform, t/c and spar depth, plus the 2D section."""
+import os
 import sys, numpy as np, matplotlib
 matplotlib.use("Agg"); import matplotlib.pyplot as plt
-sys.path.insert(0,"/home/alex/repos/OpenAeroStruct")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[3]))
 import aerosandbox as asb
 from studies.vsp_planform import config, param
 param.REGION_A_RULE["const_chord"]="preserved"
@@ -80,7 +81,7 @@ ax.axvline(0.75,color="#2a9d8f",ls="--",lw=1.3); ax.axvline(0.125,color="#2a9d8f
 ax.annotate("front spar 0.125c",xy=(0.125,-0.13),fontsize=8,color="#2a9d8f",ha="center")
 ax.annotate("aft spar 0.75c",xy=(0.75,-0.13),fontsize=8,color="#2a9d8f",ha="center")
 ax.set_title("2D sections, normalized");ax.set_xlabel("x/c");ax.set_ylabel("y/c");ax.set_aspect("equal");ax.grid(alpha=.25);ax.legend(fontsize=9,loc="upper right")
-p="/home/alex/repos/OpenAeroStruct/studies/vsp_planform/out/figures/best_case_constchord.png"
+p=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),"out","figures","best_case_constchord.png")
 fig.savefig(p,dpi=130); print(p)
 for nm in ("fx2","naca664221"):
     a=asb.Airfoil(nm); print(f"  {nm:12s} t_max {float(a.max_thickness()):.4f}  t@0.75c {float(a.local_thickness(x_over_c=0.75)):.4f}")

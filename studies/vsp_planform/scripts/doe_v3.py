@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, "/home/alex/repos/OpenAeroStruct")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[3]))
 import aerosandbox as asb  # noqa: E402
 
 from studies.vsp_planform import config  # noqa: E402

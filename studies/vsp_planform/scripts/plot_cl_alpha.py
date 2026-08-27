@@ -16,7 +16,7 @@ import numpy as np
 HERE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "out", "figures"
 )
-DOE = "/home/alex/repos/OpenAeroStruct/studies/vsp_planform/data/airfoil_doe.csv"
+DOE = str(pathlib.Path(__file__).resolve().parent.parent / "data" / "airfoil_doe.csv")
 
 RE_REF = 5.0e6  # mid-range: the wing spans Re 1.7e6 (tip) to 1.7e7 (root)
 

@@ -1,7 +1,7 @@
 """Split the -4.7% into planform vs airfoil, and render the 3D wing + twist."""
 import sys, numpy as np, matplotlib
 matplotlib.use("Agg"); import matplotlib.pyplot as plt
-sys.path.insert(0,"/home/alex/repos/OpenAeroStruct")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[3]))
 from scipy.optimize import lsq_linear
 from studies.vsp_planform import config, param
 param.REGION_A_RULE["const_chord"]="preserved"

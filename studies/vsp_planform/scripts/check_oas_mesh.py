@@ -17,7 +17,7 @@ import sys
 import numpy as np
 import openmdao.api as om
 
-sys.path.insert(0, "/home/alex/repos/OpenAeroStruct")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[3]))
 
 from openaerostruct.aerodynamics.aero_groups import AeroPoint
 from openaerostruct.meshing.mesh_generator import generate_mesh

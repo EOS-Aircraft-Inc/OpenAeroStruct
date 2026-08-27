@@ -173,7 +173,9 @@ if __name__ == "__main__":
     print("  rebuilding wing 2 (admissible, spar 0.400c) ...")
     cases["wing 2\n(7 in @ junction)"] = rebuild_from(w2case, ((356.0, 0.750), (674.9, 0.400)), stations_w2)
 
-    w3d = json.load(open(os.path.join(LOGS, "wing3_design_point.json")))
+    # wing 3 is rebuilt from aileron_90.json below. (There was a load of
+    # "wing3_design_point.json" here whose result was never used, and which no
+    # script in the repo writes -- it crashed the comparison on a clean tree.)
     ail = json.load(open(os.path.join(LOGS, "aileron_90.json")))
     w3case = [c for c in ail["cases"] if c["depth_req_in"] == 6.0 and abs(c["junction_spar_xc"] - 0.550) < 1e-9][0]
     y_ail = ail["meta"]["y_aileron_in"]

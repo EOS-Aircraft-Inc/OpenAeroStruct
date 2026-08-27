@@ -4,7 +4,7 @@ Reports the distribution, not endpoints: full spanwise twist, sign changes in th
 gradient, and where peak incidence sits.
 """
 import sys, numpy as np, openmdao.api as om
-sys.path.insert(0,"/home/alex/repos/OpenAeroStruct")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[3]))
 from scipy.optimize import lsq_linear
 from studies.vsp_planform import config, param
 param.REGION_A_RULE["const_chord"]="preserved"

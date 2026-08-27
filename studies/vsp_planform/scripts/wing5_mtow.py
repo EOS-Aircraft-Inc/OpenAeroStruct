@@ -92,8 +92,25 @@ def run(cp_toc, label):
 
 
 if __name__ == "__main__":
-    cp5 = json.load(open(os.path.join(LOGS, "wing5.json")))["wing5"][-1]["cp"]
-    print(f"wing 5 t/c cp = {[round(c, 4) for c in cp5]}")
+    # The t/c control points are DETERMINISTIC -- wing5.wing5_cp fits them to the
+    # crossover-informed target profile (root 0.220, ratio 0.58, blend to the
+    # as-built loft by WS 447) using nothing but the OAS spline basis. WingCalc
+    # enters wing5.py only for the weight loop, and cp is held fixed across its
+    # passes. So the geometry regenerates without the structural tool: prefer the
+    # coupled log when it exists, otherwise recompute the same vector here.
+    w5log = os.path.join(LOGS, "wing5.json")
+    if os.path.exists(w5log):
+        cp5 = json.load(open(w5log))["wing5"][-1]["cp"]
+        print(f"wing 5 t/c cp = {[round(c, 4) for c in cp5]}  (from wing5.json)")
+    else:
+        from wing5 import wing5_cp
+        w2.apply_wing2_box()
+        _m, _s, _r, _pf = w2.load_relofted(w2.BASELINE, w2.REGION_A_END_IN)
+        _p, _ = ro.build_problem(w2.BASELINE, _m, _s, _r, _pf)
+        _p.run_model()
+        cp5, _t, _y = wing5_cp(_p, int(np.asarray(_p.get_val("wing.t_over_c_cp")).size))
+        cp5 = list(map(float, cp5))
+        print(f"wing 5 t/c cp = {[round(c, 4) for c in cp5]}  (recomputed, no WingCalc)")
 
     print("\nrunning wing 3 at MTOW (as-built t/c, control) ...")
     w3 = run(None, "wing 3")

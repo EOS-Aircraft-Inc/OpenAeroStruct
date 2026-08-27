@@ -1,7 +1,7 @@
 """2D results for the high-Cl_max candidates. Cl_max = FIRST peak only."""
 import sys, numpy as np, matplotlib
 matplotlib.use("Agg"); import matplotlib.pyplot as plt
-sys.path.insert(0,"/home/alex/repos/OpenAeroStruct")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[3]))
 import aerosandbox as asb
 from studies.vsp_planform import config
 AL=np.arange(-8,22.05,0.5); CL_OP=0.93

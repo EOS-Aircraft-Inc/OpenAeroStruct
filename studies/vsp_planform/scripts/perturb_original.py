@@ -7,7 +7,7 @@ and camber that the DOE showed were already good.
 """
 import sys, numpy as np, matplotlib
 matplotlib.use("Agg"); import matplotlib.pyplot as plt
-sys.path.insert(0,"/home/alex/repos/OpenAeroStruct")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[3]))
 import aerosandbox as asb
 from studies.vsp_planform import config
 from studies.vsp_planform.degen_csv import read_degen_csv
