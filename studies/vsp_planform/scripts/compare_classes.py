@@ -145,15 +145,23 @@ def baseline_case(name="plan_l"):
             "station_chord_in": (np.asarray(prob.get_val("station_chord", units="m"))
                                  [n_st:] / config.SCALE),
             "constraint_width_in": None, "constraint_stations": stations,
-            "aft_pct": PLAN_L_AFT_PCT}
+            "aft_pct": PLAN_L_AFT_PCT,
+            STRAIGHT_LINE_KEY: float(prob.get_val("wing.wingbox_pct")[0])}
 
 
+# Arc A / B / C are the architectures; the wing numbers are the runs that
+# produced them, kept in the labels so the design points stay traceable.
 CLASSES = [
-    ("free\n(kinking aft spar)", "#C44E52", "wing 3"),
-    ("straight\nfront spar", "#4C72B0", "wing 7"),
-    ("constant\nchord", "#DD8452", "wing 8"),
+    ("Arc A\nconstant chord", "#DD8452", "wing 8"),
+    ("Arc B\nstraight front spar", "#4C72B0", "wing 7"),
+    ("Arc C\nfree (kinking aft spar)", "#C44E52", "wing 3"),
     ("Plan L\nas-built", PLAN_L_COLOR, "reference"),
 ]
+# The straight line each architecture is built around -- the chord fraction held
+# straight, `wingbox_pct`. This is what actually separates them: Arc B pins it at
+# the front spar, Arc A and Arc C let it optimize near the aft spar, and Plan L's
+# is the least-squares fit to its as-built loft.
+STRAIGHT_LINE_KEY = "wingbox_pct"
 
 
 def replay(case, y_a_in, rule):
@@ -200,7 +208,8 @@ def replay(case, y_a_in, rule):
                                     [:len(stations)] / config.SCALE),
             "constraint_width_in": (np.asarray(prob.get_val("wingbox_width", units="m"))
                                     [:len(stations)] / config.SCALE),
-            "constraint_stations": stations}
+            "constraint_stations": stations,
+            STRAIGHT_LINE_KEY: float(prob.get_val("wing.wingbox_pct")[0])}
 
 
 if __name__ == "__main__":
@@ -217,8 +226,8 @@ if __name__ == "__main__":
     r_pl = baseline_case("plan_l")
     # Plan L LAST in the list so the three optimized classes keep their order and
     # colours, and the reference reads as a reference.
-    res = [r_free, r_fwd, r_cc, r_pl]
-    ref = r_free["drag_N"]
+    res = [r_cc, r_fwd, r_free, r_pl]          # Arc A, Arc B, Arc C, reference
+    ref = r_pl["drag_N"]                        # Plan L as-built: every % is against it
 
     schedule, stations, _ = stations_and_schedule()
     ret = retention_fn()
@@ -227,6 +236,9 @@ if __name__ == "__main__":
     fig = plt.figure(figsize=(16.5, 16))
     gs = fig.add_gridspec(4, 3, height_ratios=[1.0, 1.2, 1.0, 1.0], hspace=0.42, wspace=0.30)
     names = [c[0] for c in CLASSES]
+    # Bar ticks get the short name only -- "Arc A constant chord" and its
+    # neighbours overlap. The line panels carry the full descriptor in the legend.
+    short = [c[0].split("\n")[0] for c in CLASSES]
     cols = [c[1] for c in CLASSES]
     xs = np.arange(len(CLASSES))
 
@@ -236,10 +248,12 @@ if __name__ == "__main__":
     for i, r in enumerate(res):
         d = r["drag_N"] - ref
         lbl = f"{r['drag_N']:.0f}\n{100*(r['drag_N']/ref-1):+.2f}%"
-        if i:
-            lbl += f"\nmust save\n{BREAK_EVEN_LB_PER_N*d:.0f} lb"
+        if abs(d) > 1e-9:
+            # drag saved against Plan L is a weight ALLOWANCE at break-even: this
+            # design may be that much heavier and still match Plan L on range.
+            lbl += f"\nmay weigh\n{abs(BREAK_EVEN_LB_PER_N*d):+.0f} lb"
         ax.text(i, r["drag_N"] + 6, lbl, ha="center", va="bottom", fontsize=8.5, fontweight="bold")
-    ax.set_xticks(xs); ax.set_xticklabels(names, fontsize=9)
+    ax.set_xticks(xs); ax.set_xticklabels(short, fontsize=9.5)
     ax.set_ylabel("drag, N"); ax.set_title("Total drag at MTOW")
     ax.set_ylim(min(r["drag_N"] for r in res) - 60, max(r["drag_N"] for r in res) + 130)
     ax.grid(alpha=0.25, axis="y")
@@ -252,7 +266,7 @@ if __name__ == "__main__":
     for i in range(len(CLASSES)):
         ax.text(i, ind[i] / 2, f"{ind[i]:.0f}", ha="center", va="center", color="w", fontsize=9)
         ax.text(i, ind[i] + vis[i] / 2, f"{vis[i]:.0f}", ha="center", va="center", color="w", fontsize=9)
-    ax.set_xticks(xs); ax.set_xticklabels(names, fontsize=9)
+    ax.set_xticks(xs); ax.set_xticklabels(short, fontsize=9.5)
     ax.set_ylabel("drag, N"); ax.set_title("Induced vs viscous (wave = 0)")
     ax.legend(fontsize=8.5); ax.grid(alpha=0.25, axis="y")
 
@@ -262,7 +276,7 @@ if __name__ == "__main__":
     for i, r in enumerate(res):
         ax.text(i, r["S_ref"] + 0.12, f"{r['S_ref']:.2f} m²\n{r['S_ref']*M2_FT2:.1f} ft²",
                 ha="center", va="bottom", fontsize=8.5, fontweight="bold")
-    ax.set_xticks(xs); ax.set_xticklabels(names, fontsize=9)
+    ax.set_xticks(xs); ax.set_xticklabels(short, fontsize=9.5)
     ax.set_ylabel("S_ref, m²"); ax.set_title("Wing area")
     lo = min(r["S_ref"] for r in res) - 1.5; hi = max(r["S_ref"] for r in res) + 2.6
     ax.set_ylim(lo, hi)
@@ -331,18 +345,38 @@ if __name__ == "__main__":
     # front spar is the study's 0.12c applied for comparability, not a measurement.
     ax = fig.add_subplot(gs[2, 2])
     yy = REPORT_STATIONS_IN
-    ax.plot(yy, [float(rear_spar_fraction(v, schedule)) for v in yy], color="#C44E52",
-            lw=1.8, label="aft spar, scheduled (wings 3/7/8)")
-    ax.axhline(PLAN_L_AFT_PCT, color=PLAN_L_COLOR, ls="--", lw=1.6,
-               label=f"Plan L fitted straight spar ({PLAN_L_AFT_PCT:.3f}c)")
-    ax.axhline(w2.FRONT_PCT, color="k", ls="-.", lw=1.4, label=f"front spar {w2.FRONT_PCT:.2f}c (all)")
-    for ys_, lab in NACELLES.items():
+    sched = np.array([float(rear_spar_fraction(v, schedule)) for v in yy])
+    # A, B and C are built to the SAME box -- front 0.12c, aft 0.750c held to
+    # 356 in then kinking to 0.550c at the junction -- so their spar lines
+    # coincide exactly. Staggered dashes draw all four rather than hiding three
+    # under one curve. Plan L has no scheduled box at all: one fitted straight
+    # spar, and a front spar that is the study's 0.12c applied for comparability.
+    dashes = [(1, 0), (6, 3), (2, 2.5), (5, 2)]
+    for (nm, c, tag), dash, r in zip(CLASSES, dashes, res):
+        lbl = nm.replace(chr(10), " ")
+        if tag == "reference":
+            ax.plot(yy, np.full_like(yy, PLAN_L_AFT_PCT), color=c, lw=2.0, dashes=dash,
+                    label=f"{lbl}: fitted spar {PLAN_L_AFT_PCT:.3f}c")
+        else:
+            ax.plot(yy, sched, color=c, lw=1.9, dashes=dash, label=f"{lbl}: aft 0.750c to 0.550c")
+        ax.plot(yy, np.full_like(yy, w2.FRONT_PCT), color=c, lw=1.4, dashes=dash, alpha=0.85)
+    # the straight line each architecture is actually built around
+    for (nm, c, tag), r in zip(CLASSES, res):
+        p_str = r.get(STRAIGHT_LINE_KEY)
+        if p_str is None:
+            continue
+        ax.plot([692], [p_str], marker="<", color=c, ms=9, mec="k", mew=0.7, clip_on=False, zorder=6)
+        ax.annotate(f"{p_str:.3f}", xy=(702, p_str), fontsize=7.2, color=c, va="center")
+    ax.text(0.02, 0.05, "lower band: front spar 0.12c (all four)\nmarkers: the STRAIGHT line each is built around",
+            transform=ax.transAxes, fontsize=7.0, color="0.3")
+    for ys_ in NACELLES:
         ax.axvline(ys_, color="0.45", ls=":", lw=1.0)
     ax.axvline(0.90 * 708.0, color="#8172B2", ls="--", lw=1.1)
-    ax.annotate("schedule breakpoints\n356 in / 674.9 in", xy=(360, 0.30), fontsize=7.2, color="0.35")
-    ax.set_ylim(0.0, 0.85); ax.set_xlabel("y, in"); ax.set_ylabel("spar station, x/c")
+    ax.annotate("breakpoints\n356 / 674.9 in", xy=(362, 0.28), fontsize=7.0, color="0.35")
+    ax.set_ylim(0.0, 0.88); ax.set_xlim(0, 760)
+    ax.set_xlabel("y, in"); ax.set_ylabel("spar station, x/c")
     ax.set_title("Front and aft spar chord ratios", fontsize=10.5)
-    ax.legend(fontsize=7.0, loc="lower left"); ax.grid(alpha=0.25)
+    ax.legend(fontsize=6.6, loc="upper left"); ax.grid(alpha=0.25)
 
     # --- aft-spar DEPTH. The requirement the whole wing 2/3 exercise turns on:
     # depth = retention(spar x/c) * t/c * chord, so chord taken for drag is depth
@@ -384,8 +418,9 @@ if __name__ == "__main__":
     fig.suptitle("Best drag available inside each planform constraint class — full OAS at MTOW 382 547 N, "
                  "span pinned at 118 ft, all trimmed to the same lift", fontsize=12)
     fig.text(0.5, 0.025,
-             "Drag is NOT the merit function: the study ranks on electric range at fixed MTOW (m_batt/D). The 'must save' figures are what each class has to buy back "
-             "in structure to be worth having.\nThose weights need WingCalc. Wing-only drag throughout. Depth and width use the as-built section's thickness retention.",
+             "All percentages are against PLAN L AS-BUILT. Drag is NOT the merit function: the study ranks on electric range at fixed MTOW (m_batt/D), break-even "
+             f"{BREAK_EVEN_LB_PER_N:.3f} lb of wing per newton,\nso 'may weigh' is how much heavier each architecture can be and still match Plan L on range. "
+             "Wing-only drag throughout. Depth and width use the as-built section's thickness retention.",
              ha="center", fontsize=8.5, style="italic")
 
     os.makedirs(FIGS, exist_ok=True)
@@ -401,10 +436,10 @@ if __name__ == "__main__":
               f"box {w_in:6.2f} in @ inboard nacelle (need 65), {w_out:6.2f} in @ outboard (need 55)")
 
     print("\n" + "=" * 84)
-    print(f"{'class':26} {'drag N':>10} {'vs free':>9} {'S_ref':>8} {'induced':>9} {'viscous':>9} {'must save lb':>13}")
+    print(f"{'architecture':26} {'drag N':>10} {'vs Plan L':>9} {'S_ref':>8} {'induced':>9} {'viscous':>9} {'may weigh lb':>13}")
     for (nm, _, tag), r in zip(CLASSES, res):
         d = r["drag_N"] - ref
-        print(f"{nm.replace(chr(10), ' ') + ' [' + tag + ']':26} {r['drag_N']:>10.1f} "
+        print(f"{nm.split(chr(10))[0] + ' (' + tag + ')':26} {r['drag_N']:>10.1f} "
               f"{100*(r['drag_N']/ref-1):>+8.2f}% {r['S_ref']:>8.3f} {r['induced_N']:>9.1f} "
-              f"{r['viscous_N']:>9.1f} {BREAK_EVEN_LB_PER_N*d:>13.1f}")
+              f"{r['viscous_N']:>9.1f} {-BREAK_EVEN_LB_PER_N*d:>+13.1f}")
     print("=" * 84)
