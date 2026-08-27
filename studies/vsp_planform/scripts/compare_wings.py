@@ -245,7 +245,15 @@ if __name__ == "__main__":
         ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else []))
     can_size = subprocess.run([sys.executable, "-c", "import WingCalc_Tool"],
                               capture_output=True).returncode == 0
-    if not can_size:
+    # The deck is the other half of "can the sizer run". A clone carries the decks
+    # its own repo ships, and WC_DECK may name one built locally -- importable but
+    # deckless crashed this script in write_deck's copytree, AFTER every case had
+    # been rebuilt, which loses the whole figure to a missing input directory.
+    if can_size and not wcdeck.WC_DECK.exists():
+        can_size = False
+        print(f"  NOTE: WingCalc imports but its deck is missing: {wcdeck.WC_DECK}\n"
+              f"        Sizing skipped; the drag panels are unaffected.")
+    elif not can_size:
         print("  NOTE: WingCalc_Tool is not importable in a fresh interpreter, so its "
               "spawn workers cannot start.\n        Sizing skipped; cases without a "
               "recorded weight are drawn as 'not sized'.")
