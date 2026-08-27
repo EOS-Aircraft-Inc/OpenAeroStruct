@@ -25,8 +25,10 @@ maxima, margins still -0.165). The reference deck allows 6-100 and closes.
 """
 
 import csv
+import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 from studies.vsp_planform.coupling import geometry as wg
@@ -119,6 +121,32 @@ def _wingcalc():
     return mod
 
 
+def _alias_dir_for_workers():
+    """Make ``WingCalc_Tool`` importable by NAME, for the sizer's spawn workers.
+
+    ``_wingcalc`` binds the package through importlib, which lives only in this
+    interpreter. The bay sizer uses a "spawn" pool, so each worker starts a fresh
+    interpreter and re-imports the pickled callable's module -- ``WingCalc_Tool``,
+    which is not on any path because the clone is named
+    ``Structures-WingCalc_Tool``. The workers then die on import in a loop that
+    never raises, so the sizing appears to hang.
+
+    A directory holding a correctly-named symlink, exported on PYTHONPATH so the
+    children inherit it, is what closes that gap. Nothing is written inside
+    either repository.
+    """
+    if WC_ROOT.name == "WingCalc_Tool":
+        return WC_ROOT.parent
+    alias = Path(tempfile.gettempdir()) / "wingcalc_pkg_alias"
+    alias.mkdir(parents=True, exist_ok=True)
+    link = alias / "WingCalc_Tool"
+    if link.is_symlink() and link.resolve() != WC_ROOT.resolve():
+        link.unlink()
+    if not link.exists():
+        link.symlink_to(WC_ROOT, target_is_directory=True)
+    return alias
+
+
 def run_wingcalc(deck, outdir):
     """Size every bay on this deck and return the full wing weight, lb.
 
@@ -126,6 +154,10 @@ def run_wingcalc(deck, outdir):
     multiprocessing pool, which is also why it has no business inside an
     optimizer loop.
     """
+    alias = str(_alias_dir_for_workers())
+    existing = os.environ.get("PYTHONPATH", "")
+    if alias not in existing.split(os.pathsep):
+        os.environ["PYTHONPATH"] = (alias + os.pathsep + existing) if existing else alias
     _wingcalc()
     from WingCalc_Tool.main import optimize_bay
     optimize_bay(deck, outdir)
