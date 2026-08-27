@@ -24,10 +24,10 @@ re-optimized, and the replayed drag is checked against the logged value.
 
 DRAG IS NOT THE MERIT FUNCTION. The study ranks designs on electric range at
 fixed MTOW, m_batt/D, where wing weight trades against battery. Break-even is
-1.486 lb of wing weight per newton of drag, so the drag spread here converts into
-the weight each class must save to be worth having; the figure says so rather
-than leaving a drag ranking to be read as a verdict. Those weights need WingCalc
-and are not in this figure.
+1.486 lb of wing weight per newton of drag, so each drag bar is annotated with
+the weight that class must save to be worth having, rather than leaving a drag
+ranking to be read as a verdict. Those weights need WingCalc; range itself is not
+plotted here, since none of these three is sized.
 
 Writes out/figures/class_comparison.png.
 """
@@ -175,8 +175,8 @@ if __name__ == "__main__":
     ret = retention_fn()
     span = [spanwise(r, schedule, ret) for r in res]
 
-    fig = plt.figure(figsize=(16, 15))
-    gs = fig.add_gridspec(4, 3, height_ratios=[1.0, 1.15, 1.0, 1.0], hspace=0.42, wspace=0.28)
+    fig = plt.figure(figsize=(16, 12))
+    gs = fig.add_gridspec(3, 3, height_ratios=[1.0, 1.15, 1.0], hspace=0.40, wspace=0.28)
     names = [c[0] for c in CLASSES]
     cols = [c[1] for c in CLASSES]
     xs = np.arange(3)
@@ -291,42 +291,9 @@ if __name__ == "__main__":
     ax.set_title("Wingbox width vs requirement\n(0.12c to the scheduled aft spar)", fontsize=10.5)
     ax.legend(fontsize=7.5); ax.grid(alpha=0.25)
 
-    # --- electric range. The merit function. No weight is known for any of these
-    # three, so each design is drawn as R(w) at its OWN drag: the vertical gap at
-    # one weight is the drag penalty, and where a line crosses the reference is
-    # the weight that pays for it.
-    ax = fig.add_subplot(gs[3, :])
-    wgrid = np.linspace(7000.0, 9600.0, 240)
-    r_ref = np.array([mission.electric_range_nmi(w, ref) for w in wgrid])
-    for (nm, c, tag), r in zip(CLASSES, res):
-        rr = np.array([mission.electric_range_nmi(w, r["drag_N"]) for w in wgrid])
-        ax.plot(wgrid, rr, color=c, lw=1.8, label=f"{nm.replace(chr(10), ' ')} — {tag}")
-    # wing 3 and wing 5 are the only sized wings in the study; wing 3 is here.
-    W3_LB = 8613.9
-    ax.plot([W3_LB], [mission.electric_range_nmi(W3_LB, ref)], "o", color=CLASSES[0][1],
-            ms=8, mec="k", mew=0.8, zorder=5)
-    ax.annotate(f"wing 3 sized: {W3_LB:.0f} lb, {mission.electric_range_nmi(W3_LB, ref):.1f} nmi",
-                xy=(W3_LB, mission.electric_range_nmi(W3_LB, ref)), xytext=(12, 10),
-                textcoords="offset points", fontsize=8.5)
-    for i, ((nm, c, tag), r) in enumerate(list(zip(CLASSES, res))[1:]):
-        w_be = W3_LB - BREAK_EVEN_LB_PER_N * (r["drag_N"] - ref)
-        ax.plot([w_be], [mission.electric_range_nmi(w_be, r["drag_N"])], "s", color=c,
-                ms=7, mec="k", mew=0.8, zorder=5)
-        ax.annotate(f"{tag} break-even {w_be:.0f} lb\n({W3_LB - w_be:.0f} lb lighter than wing 3)",
-                    xy=(w_be, mission.electric_range_nmi(w_be, r["drag_N"])),
-                    xytext=(-14, -26 - 26 * i), textcoords="offset points", fontsize=8.5,
-                    color=c, ha="right",
-                    arrowprops=dict(arrowstyle="-", color=c, lw=0.8, shrinkA=0, shrinkB=3))
-    ax.set_xlabel("wing weight, lb"); ax.set_ylabel("electric range, nmi")
-    ax.set_title(f"Electric range at fixed MTOW — R = eta·e*·m_batt(w)/D, {mission.E_STAR_WH_KG:.0f} Wh/kg, eta {mission.ETA_PROP:.2f}.  "
-                 f"Break-even {BREAK_EVEN_LB_PER_N:.3f} lb per N of drag.\n"
-                 "Squares mark the weight each constrained class must reach to match the free planform. NONE of these three is sized yet.",
-                 fontsize=10.5)
-    ax.legend(fontsize=8.5); ax.grid(alpha=0.25)
-
     fig.suptitle("Best drag available inside each planform constraint class — full OAS at MTOW 382 547 N, "
                  "span pinned at 118 ft, all trimmed to the same lift", fontsize=12)
-    fig.text(0.5, 0.055,
+    fig.text(0.5, 0.025,
              "Drag is NOT the merit function: the study ranks on electric range at fixed MTOW (m_batt/D). The 'must save' figures are what each class has to buy back "
              "in structure to be worth having.\nThose weights need WingCalc. Wing-only drag throughout. Depth and width use the as-built section's thickness retention.",
              ha="center", fontsize=8.5, style="italic")
