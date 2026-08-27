@@ -67,15 +67,31 @@ ARCHS = {                       # region A end, region A rule, pinned straight l
 }
 
 
-def retention_fn():
-    af = asbuilt()
+def section(name=None):
+    """The section this design is built on: as-built, or a database airfoil.
+
+    A section reaches OAS as exactly TWO scalars -- c_max_t and the t/c
+    distribution -- through the Raymer form factor (viscous_drag.py:103). But it
+    reaches the STRUCTURE through its thickness retention at the spar, which
+    fixes c_req = depth / (retention * t/c) and therefore the chord, the area and
+    the weight. That second path is much the larger one: e694 keeps 0.142 of
+    chord at the spar against the as-built's 0.096, which is 20 in of chord not
+    spent buying depth.
+    """
+    if name in (None, "as-built"):
+        af = asbuilt()
+    else:
+        import aerosandbox as asb
+        af = asb.Airfoil(name)
     xs = np.linspace(0.05, 0.95, 300)
     t = np.array([float(af.local_thickness(x_over_c=x)) for x in xs])
-    return lambda x: float(np.interp(x, xs, t / t.max()))
+    ret = lambda x: float(np.interp(x, xs, t / t.max()))
+    c_max_t = float(xs[int(np.argmax(t))])
+    return ret, c_max_t
 
 
-RET = retention_fn()
 SPAR_AIL = float(rear_spar_fraction(Y_AIL, SCHEDULE))
+RET, C_MAX_T = section()          # replaced at run time by --airfoil
 
 
 def optimize(y_a_in, rule, pin_p, cp_toc, c_req):
@@ -94,7 +110,20 @@ def optimize(y_a_in, rule, pin_p, cp_toc, c_req):
         mesh, stick, regions, planform0 = w2.load_relofted(w2.BASELINE, y_a_in)
         if pin_p is not None:
             planform0 = baseline_planform(stick, regions, rule=rule)
-        prob, _ = ro.build_problem(w2.BASELINE, mesh, stick, regions, planform0)
+        # c_max_t is read once when the viscous component is set up, so the
+        # section has to be injected before the problem is built.
+        orig_build_surface = ro.build_surface
+
+        def _surface(mesh_, stick_, regions_, **kw):
+            sd = orig_build_surface(mesh_, stick_, regions_, **kw)
+            sd["c_max_t"] = C_MAX_T
+            return sd
+
+        ro.build_surface = _surface
+        try:
+            prob, _ = ro.build_problem(w2.BASELINE, mesh, stick, regions, planform0)
+        finally:
+            ro.build_surface = orig_build_surface
         n_cp = int(np.asarray(prob.get_val("wing.t_over_c_cp")).size)
         cp = np.linspace(cp_toc[0], cp_toc[0] * cp_toc[1], n_cp)
         prob.set_val("wing.t_over_c_cp", cp)
@@ -148,7 +177,11 @@ def solve(arc, profile):
         err = r["depth_delivered_in"] - DEPTH_REQ
         print(f"  {label} depth pass {p}: c_req {c_req:6.2f} -> depth "
               f"{r['depth_delivered_in']:5.2f} in ({err:+.3f}), drag {r['drag_N']:9.1f} N", flush=True)
-        if abs(err) < TOL_IN:
+        # The requirement is a FLOOR. Over-delivering is free -- it happens when
+        # the aileron width constraint stops binding and the chord is set
+        # elsewhere -- so anything at or above 6 in is done. Only a shortfall
+        # needs another pass, and only a shortfall can be fixed by more chord.
+        if err >= -TOL_IN:
             break
         toc_use = r["toc_delivered_ail"]
 
@@ -196,10 +229,19 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--arc", required=True, choices=sorted(ARCHS))
     ap.add_argument("--profile", required=True, choices=sorted(PROFILES))
+    ap.add_argument("--airfoil", default="as-built",
+                    help="database section name, or 'as-built' (default)")
     a = ap.parse_args()
 
+    RET, C_MAX_T = section(a.airfoil)
+    print(f"section {a.airfoil}: c_max_t {C_MAX_T:.4f}, retention at {SPAR_AIL:.4f}c "
+          f"= {RET(SPAR_AIL):.4f}", flush=True)
     res = solve(a.arc, a.profile)
-    out = os.path.join(LOGS, f"arc_optimal_toc_{a.arc}_{a.profile}.json")
+    res["airfoil"] = a.airfoil
+    res["c_max_t"] = C_MAX_T
+    res["retention_at_spar"] = RET(SPAR_AIL)
+    suffix = "" if a.airfoil == "as-built" else f"_{a.airfoil}"
+    out = os.path.join(LOGS, f"arc_optimal_toc_{a.arc}_{a.profile}{suffix}.json")
     with open(out, "w") as f:
         json.dump({k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in res.items()}, f, indent=2)
     wtxt = (f"W_wing {res['w_wing_lb']:.1f} lb, R {res['R_nmi']:.1f} nmi" if res["w_wing_lb"]

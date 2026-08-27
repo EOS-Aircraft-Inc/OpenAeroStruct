@@ -217,15 +217,34 @@ def replay(case, y_a_in, rule):
 
 
 if __name__ == "__main__":
+    # Prefer the t/c-optimised design points when they exist. arc_optimal_toc.py
+    # writes one per architecture per profile; `optimal` is the sweep's peak
+    # (root 0.250 -> tip 0.145) and `capped` stays inside conventional thickness
+    # (0.220 -> 0.165). Fall back to the as-built-t/c design points otherwise, so
+    # the figure is always producible.
+    TOC_PROFILE = os.environ.get("ARC_TOC_PROFILE", "optimal")
+
+    def arc_case(arc, fallback_file, fallback_key):
+        p_arc = os.path.join(LOGS, f"arc_optimal_toc_{arc}_{TOC_PROFILE}.json")
+        if os.path.exists(p_arc):
+            c = json.load(open(p_arc))
+            return c, f"{TOC_PROFILE} t/c ({c['toc_root']:.3f}→{c['toc_tip']:.3f})"
+        return json.load(open(os.path.join(LOGS, fallback_file)))[fallback_key], "as-built t/c"
+
     w7log = json.load(open(os.path.join(LOGS, "wing7_design_point.json")))
     w8log = json.load(open(os.path.join(LOGS, "wing8_design_point.json")))
 
-    print("  replaying free (wing 3) ...")
-    r_free = replay(w7log["wing3_mtow"], w2.REGION_A_END_IN, "root_le_fixed")
-    print("  replaying straight front spar (wing 7) ...")
-    r_fwd = replay(w7log["wing7_mtow"], w2.REGION_A_END_IN, "preserved")
-    print("  replaying constant chord (wing 8) ...")
-    r_cc = replay(w8log["constchord_asbuilt"], REGION_A_AS_BUILT_IN, "root_le_fixed")
+    cC, provC = arc_case("C", "wing7_design_point.json", "wing3_mtow")
+    cB, provB = arc_case("B", "wing7_design_point.json", "wing7_mtow")
+    cA, provA = arc_case("A", "wing8_design_point.json", "constchord_asbuilt")
+    print(f"  Arc C: {provC}\n  Arc B: {provB}\n  Arc A: {provA}")
+    print("  replaying Arc C (free) ...")
+    r_free = replay(cC, w2.REGION_A_END_IN, "root_le_fixed")
+    print("  replaying Arc B (straight front spar) ...")
+    r_fwd = replay(cB, w2.REGION_A_END_IN, "preserved")
+    print("  replaying Arc A (constant chord) ...")
+    r_cc = replay(cA, REGION_A_AS_BUILT_IN, "root_le_fixed")
+    TOC_NOTE = provC
     print("  evaluating Plan L as-built (the reference) ...")
     r_pl = baseline_case("plan_l")
     # Plan L LAST in the list so the three optimized classes keep their order and
@@ -420,7 +439,9 @@ if __name__ == "__main__":
     ax.legend(fontsize=7.5); ax.grid(alpha=0.25)
 
     fig.suptitle("Best drag available inside each planform constraint class — full OAS at MTOW 382 547 N, "
-                 "span pinned at 118 ft, all trimmed to the same lift", fontsize=12)
+                 "span pinned at 118 ft, all trimmed to the same lift\n"
+                 f"Arc A / B / C carry the {TOC_NOTE} profile; Plan L is the as-built loft",
+                 fontsize=12)
     fig.text(0.5, 0.048, DEFINITIONS, ha="center", fontsize=10, fontweight="bold")
     fig.text(0.5, 0.020,
              "All percentages are against PLAN L AS-BUILT. Drag is NOT the merit function: the study ranks on electric range at fixed MTOW (m_batt/D), break-even "
