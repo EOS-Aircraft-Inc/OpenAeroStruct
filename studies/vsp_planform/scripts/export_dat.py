@@ -128,13 +128,17 @@ def export(mesh_m, toc, name, geom_id, out_dir, n_x=201, dir_hint=None):
 def load_design(arc):
     """Replay the arc's design point and return (mesh_m, toc, provenance)."""
     y_a, rule, (fname, key) = ARCS[arc]
-    # Prefer a t/c-optimised design point when one has been produced.
+    # Prefer a t/c-optimised design point when one has been produced. The
+    # section is part of the file's identity, so it is named here too -- a bundle
+    # exported from the wrong section would carry the wrong contours entirely.
+    airfoil = os.environ.get("ARC_AIRFOIL", "e694")
+    sfx = "" if airfoil in ("", "as-built") else f"_{airfoil}"
     for prof in ("optimal", "capped"):
-        p = LOGS / f"arc_optimal_toc_{arc}_{prof}.json"
+        p = LOGS / f"arc_optimal_toc_{arc}_{prof}{sfx}.json"
         if p.exists():
             case = json.loads(p.read_text())
             r = replay(case, y_a, rule)
-            return r["mesh"], r["toc"], f"{p.name} ({prof} t/c)"
+            return r["mesh"], r["toc"], f"{p.name} ({airfoil}, {prof} t/c)"
     case = json.loads((LOGS / fname).read_text())[key]
     r = replay(case, y_a, rule)
     return r["mesh"], r["toc"], f"{fname}:{key} (as-built t/c)"

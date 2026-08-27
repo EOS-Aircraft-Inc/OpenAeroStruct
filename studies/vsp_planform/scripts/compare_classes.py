@@ -69,9 +69,20 @@ BREAK_EVEN_LB_PER_N = 15551.7 / 10463.9341
 NACELLES = {176.0: "inboard nacelle", 356.0: "outboard nacelle"}
 
 
-def retention_fn():
-    """Fraction of max thickness the as-built section still has at x/c."""
-    af = asbuilt()
+def retention_fn(airfoil=None):
+    """Fraction of max thickness a section still has at x/c.
+
+    Retention belongs to the SECTION, and it is what turns t/c into depth:
+    depth = retention(spar) * t/c * chord. Using the as-built curve on a wing
+    built with another section understates its depth -- measured, 6.65 in against
+    the 7.65 in the design actually delivers, because e694 keeps 0.935 of its
+    thickness at the 0.574c spar where the as-built keeps 0.814.
+    """
+    if airfoil in (None, "", "as-built"):
+        af = asbuilt()
+    else:
+        import aerosandbox as asb
+        af = asb.Airfoil(airfoil)
     xs = np.linspace(0.05, 0.95, 300)
     t = np.array([float(af.local_thickness(x_over_c=x)) for x in xs])
     return lambda x: float(np.interp(x, xs, t / t.max()))
@@ -182,6 +193,18 @@ def replay(case, y_a_in, rule):
 
     saved = param.REGION_A_RULE[w2.BASELINE]
     param.REGION_A_RULE[w2.BASELINE] = rule
+    # A design point built on a chosen section carries its c_max_t, and c_max_t
+    # is read once when the viscous component is set up. Replaying without it
+    # rebuilds the wing with the as-built section's form factor: measured, a
+    # 252 N discrepancy on Arc C, which the drag cross-check below catches.
+    orig_build_surface = ro.build_surface
+    c_max_t = case.get("c_max_t")
+    if c_max_t is not None:
+        def _surface(mesh_, stick_, regions_, **kw):
+            sd = orig_build_surface(mesh_, stick_, regions_, **kw)
+            sd["c_max_t"] = float(c_max_t)
+            return sd
+        ro.build_surface = _surface
     try:
         prob, _, _, _, _ = w2.build(w2.BASELINE, y_a_in)
         prob.set_val("wing.taper_B", case["taper_B"])
@@ -193,6 +216,7 @@ def replay(case, y_a_in, rule):
         prob.run_model()
     finally:
         param.REGION_A_RULE[w2.BASELINE] = saved
+        ro.build_surface = orig_build_surface
 
     s_ref = float(prob.get_val(f"{POINT}.wing.S_ref")[0])
     cd = lambda k: float(prob.get_val(f"{POINT}.wing_perf.{k}")[0])
@@ -213,6 +237,8 @@ def replay(case, y_a_in, rule):
             "constraint_width_in": (np.asarray(prob.get_val("wingbox_width", units="m"))
                                     [:len(stations)] / config.SCALE),
             "constraint_stations": stations,
+            # retention belongs to the section, so the depth panel must use this
+            "airfoil": case.get("airfoil"),
             STRAIGHT_LINE_KEY: float(prob.get_val("wing.wingbox_pct")[0])}
 
 
@@ -223,13 +249,23 @@ if __name__ == "__main__":
     # (0.220 -> 0.165). Fall back to the as-built-t/c design points otherwise, so
     # the figure is always producible.
     TOC_PROFILE = os.environ.get("ARC_TOC_PROFILE", "optimal")
+    # The section is part of the design point's identity: arc_optimal_toc writes
+    # <arc>_<profile>_<airfoil>.json for a chosen section and <arc>_<profile>.json
+    # for the as-built one. Naming it here stops a stale file from a different
+    # section being picked up silently -- which it was, for one architecture,
+    # leaving two arcs on their old design points and one on a new one.
+    ARC_AIRFOIL = os.environ.get("ARC_AIRFOIL", "e694")
+    suffix = "" if ARC_AIRFOIL in ("", "as-built") else f"_{ARC_AIRFOIL}"
 
     def arc_case(arc, fallback_file, fallback_key):
-        p_arc = os.path.join(LOGS, f"arc_optimal_toc_{arc}_{TOC_PROFILE}.json")
+        p_arc = os.path.join(LOGS, f"arc_optimal_toc_{arc}_{TOC_PROFILE}{suffix}.json")
         if os.path.exists(p_arc):
             c = json.load(open(p_arc))
-            return c, f"{TOC_PROFILE} t/c ({c['toc_root']:.3f}→{c['toc_tip']:.3f})"
-        return json.load(open(os.path.join(LOGS, fallback_file)))[fallback_key], "as-built t/c"
+            return c, (f"{ARC_AIRFOIL}, {TOC_PROFILE} t/c "
+                       f"({c['toc_root']:.3f}→{c['toc_tip']:.3f})")
+        print(f"  NOTE: {os.path.basename(p_arc)} absent -- Arc {arc} falls back "
+              f"to the as-built section at as-built t/c")
+        return json.load(open(os.path.join(LOGS, fallback_file)))[fallback_key], "as-built section, as-built t/c"
 
     w7log = json.load(open(os.path.join(LOGS, "wing7_design_point.json")))
     w8log = json.load(open(os.path.join(LOGS, "wing8_design_point.json")))
@@ -253,8 +289,9 @@ if __name__ == "__main__":
     ref = r_pl["drag_N"]                        # Plan L as-built: every % is against it
 
     schedule, stations, _ = stations_and_schedule()
-    ret = retention_fn()
-    span = [spanwise(r, schedule, ret) for r in res]
+    # one retention curve per case, from that design's own section
+    rets = [retention_fn(r.get("airfoil")) for r in res]
+    span = [spanwise(r, schedule, rt) for r, rt in zip(res, rets)]
 
     fig = plt.figure(figsize=(16.5, 16))
     gs = fig.add_gridspec(4, 3, height_ratios=[1.0, 1.2, 1.0, 1.0], hspace=0.42, wspace=0.30)
@@ -446,7 +483,7 @@ if __name__ == "__main__":
     fig.text(0.5, 0.020,
              "All percentages are against PLAN L AS-BUILT. Drag is NOT the merit function: the study ranks on electric range at fixed MTOW (m_batt/D), break-even "
              f"{BREAK_EVEN_LB_PER_N:.3f} lb of wing per newton,\nso 'may weigh' is how much heavier each architecture can be and still match Plan L on range. "
-             "Wing-only drag throughout. Depth and width use the as-built section's thickness retention.\nDesign points: Arc A = wing 8, Arc B = wing 7, Arc C = wing 3.",
+             "Wing-only drag throughout. Depth and width use EACH design's own section retention.\nDesign points: Arc A = wing 8, Arc B = wing 7, Arc C = wing 3.",
              ha="center", fontsize=8.5, style="italic")
 
     os.makedirs(FIGS, exist_ok=True)
