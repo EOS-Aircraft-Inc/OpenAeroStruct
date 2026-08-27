@@ -36,8 +36,11 @@ import coupled_loop as cl
 # (+277 / +282 / +155 / +108 % of range per unit t/c across successive bands),
 # which extrapolates to zero near root t/c ~ 0.22. These points bracket that.
 # Shape is held at the as-built taper so only the LEVEL varies.
-ROOT_TOCS = [0.200, 0.210, 0.220, 0.230, 0.250]
-TIP_RATIOS = [0.58]                 # as-built-like taper, held fixed
+# LEVEL x SHAPE, both swept. The earlier run held the shape at the as-built-like
+# 0.58 and only moved the level, which cannot answer what the profile should be.
+# 0.45 reaches a 0.10 tip from a 0.22 root; 1.00 is constant t/c to the tip.
+ROOT_TOCS = [0.180, 0.200, 0.220, 0.250]
+TIP_RATIOS = [0.45, 0.58, 0.75, 1.00]
 W_WING_SEED = 8440.1
 MTOW_LB, K_LB, PAYLOAD_LB, FUEL_LB = 86_000.0, 56_000.0, 17_100.0, 5_400.0
 BATT_LB_BOOK = 16_665.6

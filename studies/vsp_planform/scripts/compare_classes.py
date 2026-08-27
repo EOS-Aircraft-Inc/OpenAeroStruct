@@ -151,12 +151,16 @@ def baseline_case(name="plan_l"):
 
 # Arc A / B / C are the architectures; the wing numbers are the runs that
 # produced them, kept in the labels so the design points stay traceable.
+# Labels are the names alone; what each architecture IS goes in the caption, so
+# no legend has to carry a description.
 CLASSES = [
-    ("Arc A\nconstant chord", "#DD8452", "wing 8"),
-    ("Arc B\nstraight front spar", "#4C72B0", "wing 7"),
-    ("Arc C\nfree (kinking aft spar)", "#C44E52", "wing 3"),
-    ("Plan L\nas-built", PLAN_L_COLOR, "reference"),
+    ("Arc A", "#DD8452", "wing 8"),
+    ("Arc B", "#4C72B0", "wing 7"),
+    ("Arc C", "#C44E52", "wing 3"),
+    ("Plan L", PLAN_L_COLOR, "reference"),
 ]
+DEFINITIONS = ("Arc A: constant chord.   Arc B: straight forward spar.   "
+               "Arc C: free (kinking aft spar).   Plan L: as-built reference.")
 # The straight line each architecture is built around -- the chord fraction held
 # straight, `wingbox_pct`. This is what actually separates them: Arc B pins it at
 # the front spar, Arc A and Arc C let it optimize near the aft spar, and Plan L's
@@ -238,7 +242,7 @@ if __name__ == "__main__":
     names = [c[0] for c in CLASSES]
     # Bar ticks get the short name only -- "Arc A constant chord" and its
     # neighbours overlap. The line panels carry the full descriptor in the legend.
-    short = [c[0].split("\n")[0] for c in CLASSES]
+    short = [c[0] for c in CLASSES]
     cols = [c[1] for c in CLASSES]
     xs = np.arange(len(CLASSES))
 
@@ -270,17 +274,17 @@ if __name__ == "__main__":
     ax.set_ylabel("drag, N"); ax.set_title("Induced vs viscous (wave = 0)")
     ax.legend(fontsize=8.5); ax.grid(alpha=0.25, axis="y")
 
+    # Area in ft2 only -- the model works in m2, so it is converted here and
+    # nowhere else, and m2 never reaches the figure.
     ax = fig.add_subplot(gs[0, 2])
     M2_FT2 = 10.7639104
-    ax.bar(xs, [r["S_ref"] for r in res], color=cols, width=0.62)
-    for i, r in enumerate(res):
-        ax.text(i, r["S_ref"] + 0.12, f"{r['S_ref']:.2f} m²\n{r['S_ref']*M2_FT2:.1f} ft²",
-                ha="center", va="bottom", fontsize=8.5, fontweight="bold")
+    area_ft2 = [r["S_ref"] * M2_FT2 for r in res]
+    ax.bar(xs, area_ft2, color=cols, width=0.62)
+    for i, a in enumerate(area_ft2):
+        ax.text(i, a + 1.2, f"{a:.1f}", ha="center", va="bottom", fontsize=9.5, fontweight="bold")
     ax.set_xticks(xs); ax.set_xticklabels(short, fontsize=9.5)
-    ax.set_ylabel("S_ref, m²"); ax.set_title("Wing area")
-    lo = min(r["S_ref"] for r in res) - 1.5; hi = max(r["S_ref"] for r in res) + 2.6
-    ax.set_ylim(lo, hi)
-    ax2 = ax.twinx(); ax2.set_ylim(lo * M2_FT2, hi * M2_FT2); ax2.set_ylabel("S_ref, ft²")
+    ax.set_ylabel("S_ref, ft²"); ax.set_title("Wing area")
+    ax.set_ylim(min(area_ft2) - 16, max(area_ft2) + 26)
     ax.grid(alpha=0.25, axis="y")
 
     # --- planforms. x down, as in the study's other planform panels.
@@ -289,7 +293,7 @@ if __name__ == "__main__":
         m = r["mesh"] / config.SCALE
         y = np.abs(m[0, :, 1])
         ls = "--" if tag == "reference" else "-"
-        ax.plot(y, m[0, :, 0], color=c, lw=1.6, ls=ls, label=f"{nm.replace(chr(10), ' ')} — {tag}")
+        ax.plot(y, m[0, :, 0], color=c, lw=1.6, ls=ls, label=nm)
         ax.plot(y, m[-1, :, 0], color=c, lw=1.6, ls=ls)
     for ys_, lab in NACELLES.items():
         ax.axvline(ys_, color="0.45", ls=":", lw=1.0)
@@ -315,7 +319,7 @@ if __name__ == "__main__":
     for (nm, c, tag), r in zip(CLASSES, res):
         m = r["mesh"] / config.SCALE
         ax.plot(np.abs(m[0, :, 1]), r["twist"], color=c, lw=1.6,
-                ls="--" if tag == "reference" else "-", label=nm.replace(chr(10), " "))
+                ls="--" if tag == "reference" else "-", label=nm)
     ax.axhline(config.TWIST_BOUNDS[1], color="0.6", ls=":", lw=1.0)
     ax.text(5, config.TWIST_BOUNDS[1], f" +{config.TWIST_BOUNDS[1]:.0f}° bound", color="0.45",
             fontsize=7.5, va="bottom")
@@ -332,12 +336,12 @@ if __name__ == "__main__":
         m = r["mesh"] / config.SCALE
         y = np.abs(m[0, :, 1]); yp = 0.5 * (y[:-1] + y[1:])
         ax.plot(yp, r["toc"], color=c, lw=1.6, ls="--" if tag == "reference" else "-",
-                label=f"{nm.replace(chr(10), ' ')} ({r['toc'][0]:.3f} → {r['toc'][-1]:.3f})")
+                label=nm)
     for ys_ in NACELLES:
         ax.axvline(ys_, color="0.45", ls=":", lw=1.0)
     ax.set_xlabel("y, in"); ax.set_ylabel("t/c")
-    ax.set_title("Thickness ratio t/c\n(root → tip in the legend)", fontsize=10.5)
-    ax.legend(fontsize=7.0); ax.grid(alpha=0.25)
+    ax.set_title("Thickness ratio t/c", fontsize=10.5)
+    ax.legend(fontsize=7.5); ax.grid(alpha=0.25)
 
     # --- spar chord ratios. The front spar is 0.12c on every optimized design;
     # the aft spar is the piecewise-linear schedule. Plan L has neither -- it is
@@ -353,12 +357,12 @@ if __name__ == "__main__":
     # spar, and a front spar that is the study's 0.12c applied for comparability.
     dashes = [(1, 0), (6, 3), (2, 2.5), (5, 2)]
     for (nm, c, tag), dash, r in zip(CLASSES, dashes, res):
-        lbl = nm.replace(chr(10), " ")
+        lbl = nm
         if tag == "reference":
             ax.plot(yy, np.full_like(yy, PLAN_L_AFT_PCT), color=c, lw=2.0, dashes=dash,
-                    label=f"{lbl}: fitted spar {PLAN_L_AFT_PCT:.3f}c")
+                    label=lbl)
         else:
-            ax.plot(yy, sched, color=c, lw=1.9, dashes=dash, label=f"{lbl}: aft 0.750c to 0.550c")
+            ax.plot(yy, sched, color=c, lw=1.9, dashes=dash, label=lbl)
         ax.plot(yy, np.full_like(yy, w2.FRONT_PCT), color=c, lw=1.4, dashes=dash, alpha=0.85)
     # the straight line each architecture is actually built around
     for (nm, c, tag), r in zip(CLASSES, res):
@@ -376,7 +380,7 @@ if __name__ == "__main__":
     ax.set_ylim(0.0, 0.88); ax.set_xlim(0, 760)
     ax.set_xlabel("y, in"); ax.set_ylabel("spar station, x/c")
     ax.set_title("Front and aft spar chord ratios", fontsize=10.5)
-    ax.legend(fontsize=6.6, loc="upper left"); ax.grid(alpha=0.25)
+    ax.legend(fontsize=7.5, loc="upper left"); ax.grid(alpha=0.25)
 
     # --- aft-spar DEPTH. The requirement the whole wing 2/3 exercise turns on:
     # depth = retention(spar x/c) * t/c * chord, so chord taken for drag is depth
@@ -417,10 +421,11 @@ if __name__ == "__main__":
 
     fig.suptitle("Best drag available inside each planform constraint class — full OAS at MTOW 382 547 N, "
                  "span pinned at 118 ft, all trimmed to the same lift", fontsize=12)
-    fig.text(0.5, 0.025,
+    fig.text(0.5, 0.048, DEFINITIONS, ha="center", fontsize=10, fontweight="bold")
+    fig.text(0.5, 0.020,
              "All percentages are against PLAN L AS-BUILT. Drag is NOT the merit function: the study ranks on electric range at fixed MTOW (m_batt/D), break-even "
              f"{BREAK_EVEN_LB_PER_N:.3f} lb of wing per newton,\nso 'may weigh' is how much heavier each architecture can be and still match Plan L on range. "
-             "Wing-only drag throughout. Depth and width use the as-built section's thickness retention.",
+             "Wing-only drag throughout. Depth and width use the as-built section's thickness retention.\nDesign points: Arc A = wing 8, Arc B = wing 7, Arc C = wing 3.",
              ha="center", fontsize=8.5, style="italic")
 
     os.makedirs(FIGS, exist_ok=True)
@@ -436,10 +441,10 @@ if __name__ == "__main__":
               f"box {w_in:6.2f} in @ inboard nacelle (need 65), {w_out:6.2f} in @ outboard (need 55)")
 
     print("\n" + "=" * 84)
-    print(f"{'architecture':26} {'drag N':>10} {'vs Plan L':>9} {'S_ref':>8} {'induced':>9} {'viscous':>9} {'may weigh lb':>13}")
+    print(f"{'architecture':26} {'drag N':>10} {'vs Plan L':>9} {'S_ref ft2':>10} {'induced':>9} {'viscous':>9} {'may weigh lb':>13}")
     for (nm, _, tag), r in zip(CLASSES, res):
         d = r["drag_N"] - ref
-        print(f"{nm.split(chr(10))[0] + ' (' + tag + ')':26} {r['drag_N']:>10.1f} "
-              f"{100*(r['drag_N']/ref-1):>+8.2f}% {r['S_ref']:>8.3f} {r['induced_N']:>9.1f} "
+        print(f"{nm + ' (' + tag + ')':26} {r['drag_N']:>10.1f} "
+              f"{100*(r['drag_N']/ref-1):>+8.2f}% {r['S_ref']*10.7639104:>10.1f} {r['induced_N']:>9.1f} "
               f"{r['viscous_N']:>9.1f} {-BREAK_EVEN_LB_PER_N*d:>+13.1f}")
     print("=" * 84)
