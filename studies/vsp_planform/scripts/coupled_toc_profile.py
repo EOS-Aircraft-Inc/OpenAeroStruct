@@ -120,6 +120,8 @@ def run(root_toc, ratio):
     oas = {"mesh": np.asarray(prob.get_val("wing.mesh", units="m")), "toc": toc_final,
            "plate": comp.plate, "stick": comp.stick, "y_junction": 674.9}
 
+    # the tag names this point's deck and work directory: unique per point, so
+    # concurrent shards never write the same path
     tag = f"r{int(root_toc*1000)}_t{int(ratio*100)}"
     cl.write_deck(cl.WC_DECK, OUT.parent / f"deck_{tag}", MTOW_LB, W_WING_SEED, oas=oas)
     w_new = cl.run_wingcalc(OUT.parent / f"deck_{tag}", OUT.parent / f"wc_{tag}")
@@ -137,19 +139,39 @@ def run(root_toc, ratio):
 
 
 def main():
+    # Sharding. Each point is an independent coupled evaluation -- OAS optimize,
+    # export, size -- so the grid parallelises perfectly across processes. A shard
+    # takes every nth point and writes its own file; merge_shards() combines them.
+    # Cap WINGCALC_BAY_WORKERS per shard so the bay pools do not oversubscribe:
+    # shards x workers should stay under the core count.
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--nshards", type=int, default=1)
+    args = ap.parse_args()
+
+    points = [(root, ratio) for root in ROOT_TOCS for ratio in TIP_RATIOS]
+    mine = [pt for i, pt in enumerate(points) if i % args.nshards == args.shard]
+    out = (OUT if args.nshards == 1
+           else OUT.with_name(f"{OUT.stem}_shard{args.shard}{OUT.suffix}"))
+    print(f"shard {args.shard}/{args.nshards}: {len(mine)} of {len(points)} points "
+          f"-> {out.name}", flush=True)
+
     res = []
-    for root in ROOT_TOCS:
-        for ratio in TIP_RATIOS:
-            print(f"\n{'#'*78}\n# root t/c {root:.3f}, tip/root {ratio:.2f} "
-                  f"(tip {root*ratio:.3f})\n{'#'*78}", flush=True)
-            t0 = time.perf_counter()
-            r = run(root, ratio)
-            r["seconds"] = time.perf_counter() - t0
-            res.append(r)
-            print(f"\n>>> root {root:.3f} ratio {ratio:.2f} | t/c ail {r['toc_ail']:.4f} "
-                  f"| S_ref {r['S_ref']:.3f} | drag {r['drag_N']:.1f} N "
-                  f"| W_wing {r['w_wing_lb']:.1f} lb | R {r['R_nmi']:.1f} nmi", flush=True)
-            OUT.write_text(json.dumps(res, indent=2))
+    for root, ratio in mine:
+        print(f"\n{'#'*78}\n# root t/c {root:.3f}, tip/root {ratio:.2f} "
+              f"(tip {root*ratio:.3f})\n{'#'*78}", flush=True)
+        t0 = time.perf_counter()
+        r = run(root, ratio)
+        r["seconds"] = time.perf_counter() - t0
+        res.append(r)
+        print(f"\n>>> root {root:.3f} ratio {ratio:.2f} | t/c ail {r['toc_ail']:.4f} "
+              f"| S_ref {r['S_ref']:.3f} | drag {r['drag_N']:.1f} N "
+              f"| W_wing {r['w_wing_lb']:.1f} lb | R {r['R_nmi']:.1f} nmi", flush=True)
+        out.write_text(json.dumps(res, indent=2))
+
+    if args.nshards > 1:      # the merge and the table belong to the whole grid
+        return
 
     base = res[0]
     print("\n" + "=" * 122)

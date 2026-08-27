@@ -20,6 +20,13 @@ import sys
 import time
 from pathlib import Path
 
+# The repo root is not on the path from a bare script run: `pip install -e .`
+# installs `openaerostruct` only, and sys.path[0] is this directory. Every
+# other script in the study inserts it; these never did, so they worked only
+# from a shell that had already exported PYTHONPATH.
+import sys as _sys, pathlib as _pl
+_sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[3]))
+
 from studies.vsp_planform.coupling.deck import (  # noqa: E402
     WC_DECK, WC_ROOT, FRONT_PCT, AFT_PCT_SCALAR, WINGBOX_SPAN_IN,
     run_wingcalc, write_deck,
