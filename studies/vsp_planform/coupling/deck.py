@@ -35,7 +35,23 @@ from studies.vsp_planform.coupling import geometry as wg
 
 # The tool and the reference deck live with the tool, not in a scratch directory.
 WC_ROOT = Path.home() / "repos" / "Structures-WingCalc_Tool"
-WC_DECK = WC_ROOT / "Inputs" / "V3.5.3_ref"
+
+# V3.5.3_ref was a locally-built deck and is not in the repository; a fresh clone
+# has V3.5.1-V3.5.4. V3.5.3 is the substitute because the PLY BOUNDS are what
+# govern: it allows 6-100 on every group but the aft web, which is what lets the
+# inboard bays close on this geometry. The shipped PlanL deck's 6-60/50/40 pins 11
+# of 13 groups at their maxima and still leaves margins at -0.165. Anything with
+# 6-100 will do; the geometry is overwritten from OAS regardless.
+# V3.5.4 before V3.5.3: they differ in exactly one line, and it is the one that
+# matters here. V3.5.3 puts the access cut-out's alternative at Stg 9, which on
+# this geometry is against a spar in bay 19 -- the sizer raises "bay 19 has
+# nowhere to put the access cut-out" and the run dies outboard. V3.5.4 uses
+# Stg 8, an interior stringer, and it is also the deck the study's independent
+# cross-check was run against. Ply bounds are identical (6-100).
+_DECK_CANDIDATES = ("V3.5.3_ref", "V3.5.4", "V3.5.3")
+WC_DECK = next((WC_ROOT / "Inputs" / d for d in _DECK_CANDIDATES
+                if (WC_ROOT / "Inputs" / d).is_dir()),
+               WC_ROOT / "Inputs" / _DECK_CANDIDATES[0])
 
 FRONT_PCT = 0.12
 AFT_PCT_SCALAR = 0.750

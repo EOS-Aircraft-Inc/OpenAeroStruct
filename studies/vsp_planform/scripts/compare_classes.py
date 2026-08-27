@@ -46,7 +46,8 @@ sys.path.insert(0, os.path.dirname(_HERE))
 sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(_HERE), "..", "..", "..")))
 
 from studies.vsp_planform import config, param                 # noqa: E402
-from studies.vsp_planform.run_opt import POINT                 # noqa: E402
+import studies.vsp_planform.run_opt as ro                       # noqa: E402
+from studies.vsp_planform.run_opt import POINT, trim_alpha      # noqa: E402
 import wing2_oas as w2                                         # noqa: E402
 from wing5_mtow import stations_and_schedule                   # noqa: E402
 from wing8_constchord_toc import REGION_A_AS_BUILT_IN          # noqa: E402
@@ -94,6 +95,12 @@ def spanwise(r, schedule, ret):
     """
     y = REPORT_STATIONS_IN
     chord = r["station_chord_in"]
+    if r.get("aft_pct") is not None:      # as-built: one fitted, unscheduled spar
+        sp = np.full(y.shape, float(r["aft_pct"]))
+        m0 = r["mesh"] / config.SCALE
+        y0 = np.abs(m0[0, :, 1]); yp0 = 0.5 * (y0[:-1] + y0[1:])
+        toc0 = np.interp(y, yp0, r["toc"])
+        return y, chord, np.array([ret(v) for v in sp]) * toc0 * chord, (sp - w2.FRONT_PCT) * chord
     m = r["mesh"] / config.SCALE
     y_mesh = np.abs(m[0, :, 1])
     yp = 0.5 * (y_mesh[:-1] + y_mesh[1:])
@@ -104,10 +111,48 @@ def spanwise(r, schedule, ret):
     return y, chord, depth, width
 
 
+PLAN_L_COLOR = "#8C7B6B"
+# Plan L's straight spar, least-squares fitted over regions A+B (README): the
+# loft has no scheduled box, so this is what its aft spar actually is. The front
+# spar is not measurable from the loft; the study's 0.12c is applied so the box
+# width is comparable, and the panels say so.
+PLAN_L_AFT_PCT = 0.60065
+
+
+def baseline_case(name="plan_l"):
+    """As-built baseline at MTOW: run, trimmed, never optimized."""
+    from studies.vsp_planform.run_opt import load_baseline
+    schedule, stations, _ = stations_and_schedule()
+    config.WINGBOX_FRONT_PCT = w2.FRONT_PCT
+    config.WINGBOX_REAR_SCHEDULE = schedule
+    report = tuple((float(v), 0.0) for v in REPORT_STATIONS_IN)
+    config.WINGBOX_WIDTH_STATIONS = tuple(stations) + report
+
+    mesh, stick, regions, planform0, _, _ = load_baseline(name)
+    prob, _ = ro.build_problem(name, mesh, stick, regions, planform0)
+    prob.run_model()
+    s_ref = float(prob.get_val(f"{POINT}.wing.S_ref")[0])
+    trim_alpha(prob, w2.W / (q * s_ref))
+    s_ref = float(prob.get_val(f"{POINT}.wing.S_ref")[0])
+    cd = lambda k: float(prob.get_val(f"{POINT}.wing_perf.{k}")[0])
+    n_st = len(stations)
+    return {"S_ref": s_ref,
+            "drag_N": q * s_ref * (cd("CDi") + cd("CDv") + cd("CDw")),
+            "induced_N": q * s_ref * cd("CDi"), "viscous_N": q * s_ref * cd("CDv"),
+            "mesh": np.asarray(prob.get_val("wing.mesh", units="m")),
+            "toc": np.asarray(prob.get_val("wing.t_over_c")).ravel().copy(),
+            "twist": np.asarray(prob.get_val("twist_abs", units="deg")).ravel().copy(),
+            "station_chord_in": (np.asarray(prob.get_val("station_chord", units="m"))
+                                 [n_st:] / config.SCALE),
+            "constraint_width_in": None, "constraint_stations": stations,
+            "aft_pct": PLAN_L_AFT_PCT}
+
+
 CLASSES = [
     ("free\n(kinking aft spar)", "#C44E52", "wing 3"),
     ("straight\nfront spar", "#4C72B0", "wing 7"),
     ("constant\nchord", "#DD8452", "wing 8"),
+    ("Plan L\nas-built", PLAN_L_COLOR, "reference"),
 ]
 
 
@@ -168,18 +213,22 @@ if __name__ == "__main__":
     r_fwd = replay(w7log["wing7_mtow"], w2.REGION_A_END_IN, "preserved")
     print("  replaying constant chord (wing 8) ...")
     r_cc = replay(w8log["constchord_asbuilt"], REGION_A_AS_BUILT_IN, "root_le_fixed")
-    res = [r_free, r_fwd, r_cc]
+    print("  evaluating Plan L as-built (the reference) ...")
+    r_pl = baseline_case("plan_l")
+    # Plan L LAST in the list so the three optimized classes keep their order and
+    # colours, and the reference reads as a reference.
+    res = [r_free, r_fwd, r_cc, r_pl]
     ref = r_free["drag_N"]
 
     schedule, stations, _ = stations_and_schedule()
     ret = retention_fn()
     span = [spanwise(r, schedule, ret) for r in res]
 
-    fig = plt.figure(figsize=(16, 12))
-    gs = fig.add_gridspec(3, 3, height_ratios=[1.0, 1.15, 1.0], hspace=0.40, wspace=0.28)
+    fig = plt.figure(figsize=(16.5, 16))
+    gs = fig.add_gridspec(4, 3, height_ratios=[1.0, 1.2, 1.0, 1.0], hspace=0.42, wspace=0.30)
     names = [c[0] for c in CLASSES]
     cols = [c[1] for c in CLASSES]
-    xs = np.arange(3)
+    xs = np.arange(len(CLASSES))
 
     # --- total drag, with the break-even weight each class must buy back
     ax = fig.add_subplot(gs[0, 0])
@@ -200,7 +249,7 @@ if __name__ == "__main__":
     ind = [r["induced_N"] for r in res]; vis = [r["viscous_N"] for r in res]
     ax.bar(xs, ind, color="#4C72B0", width=0.62, label="induced")
     ax.bar(xs, vis, bottom=ind, color="#DD8452", width=0.62, label="viscous")
-    for i in range(3):
+    for i in range(len(CLASSES)):
         ax.text(i, ind[i] / 2, f"{ind[i]:.0f}", ha="center", va="center", color="w", fontsize=9)
         ax.text(i, ind[i] + vis[i] / 2, f"{vis[i]:.0f}", ha="center", va="center", color="w", fontsize=9)
     ax.set_xticks(xs); ax.set_xticklabels(names, fontsize=9)
@@ -208,22 +257,26 @@ if __name__ == "__main__":
     ax.legend(fontsize=8.5); ax.grid(alpha=0.25, axis="y")
 
     ax = fig.add_subplot(gs[0, 2])
+    M2_FT2 = 10.7639104
     ax.bar(xs, [r["S_ref"] for r in res], color=cols, width=0.62)
     for i, r in enumerate(res):
-        ax.text(i, r["S_ref"] + 0.05, f"{r['S_ref']:.2f}", ha="center", va="bottom",
-                fontsize=9, fontweight="bold")
+        ax.text(i, r["S_ref"] + 0.12, f"{r['S_ref']:.2f} m²\n{r['S_ref']*M2_FT2:.1f} ft²",
+                ha="center", va="bottom", fontsize=8.5, fontweight="bold")
     ax.set_xticks(xs); ax.set_xticklabels(names, fontsize=9)
     ax.set_ylabel("S_ref, m²"); ax.set_title("Wing area")
-    ax.set_ylim(min(r["S_ref"] for r in res) - 1.2, max(r["S_ref"] for r in res) + 1.2)
+    lo = min(r["S_ref"] for r in res) - 1.5; hi = max(r["S_ref"] for r in res) + 2.6
+    ax.set_ylim(lo, hi)
+    ax2 = ax.twinx(); ax2.set_ylim(lo * M2_FT2, hi * M2_FT2); ax2.set_ylabel("S_ref, ft²")
     ax.grid(alpha=0.25, axis="y")
 
     # --- planforms. x down, as in the study's other planform panels.
-    ax = fig.add_subplot(gs[1, :2])
+    ax = fig.add_subplot(gs[1, :])
     for (nm, c, tag), r in zip(CLASSES, res):
         m = r["mesh"] / config.SCALE
         y = np.abs(m[0, :, 1])
-        ax.plot(y, m[0, :, 0], color=c, lw=1.6, label=f"{nm.replace(chr(10), ' ')} — {tag}")
-        ax.plot(y, m[-1, :, 0], color=c, lw=1.6)
+        ls = "--" if tag == "reference" else "-"
+        ax.plot(y, m[0, :, 0], color=c, lw=1.6, ls=ls, label=f"{nm.replace(chr(10), ' ')} — {tag}")
+        ax.plot(y, m[-1, :, 0], color=c, lw=1.6, ls=ls)
     for ys_, lab in NACELLES.items():
         ax.axvline(ys_, color="0.45", ls=":", lw=1.0)
         ax.annotate(lab, xy=(ys_, 0.985), xycoords=("data", "axes fraction"),
@@ -235,9 +288,9 @@ if __name__ == "__main__":
     ax.set_title("Planforms — leading and trailing edges")
     ax.legend(fontsize=8.5, loc="center left"); ax.grid(alpha=0.25)
 
-    ax = fig.add_subplot(gs[1, 2])
+    ax = fig.add_subplot(gs[3, 2])
     for (nm, c, tag), (y, chord, _, _) in zip(CLASSES, span):
-        ax.plot(y, chord, color=c, lw=1.6)
+        ax.plot(y, chord, color=c, lw=1.6, ls="--" if tag == "reference" else "-")
     for ys_ in NACELLES:
         ax.axvline(ys_, color="0.45", ls=":", lw=1.0)
     ax.set_xlabel("y, in"); ax.set_ylabel("chord, in")
@@ -247,7 +300,8 @@ if __name__ == "__main__":
     ax = fig.add_subplot(gs[2, 0])
     for (nm, c, tag), r in zip(CLASSES, res):
         m = r["mesh"] / config.SCALE
-        ax.plot(np.abs(m[0, :, 1]), r["twist"], color=c, lw=1.6, label=nm.replace(chr(10), " "))
+        ax.plot(np.abs(m[0, :, 1]), r["twist"], color=c, lw=1.6,
+                ls="--" if tag == "reference" else "-", label=nm.replace(chr(10), " "))
     ax.axhline(config.TWIST_BOUNDS[1], color="0.6", ls=":", lw=1.0)
     ax.text(5, config.TWIST_BOUNDS[1], f" +{config.TWIST_BOUNDS[1]:.0f}° bound", color="0.45",
             fontsize=7.5, va="bottom")
@@ -255,12 +309,47 @@ if __name__ == "__main__":
     ax.set_title("Twist distribution (absolute)")
     ax.legend(fontsize=7.5); ax.grid(alpha=0.25)
 
+    # --- t/c. The question the thickness work turns on: does the section get
+    # thinner outboard, and by how much. Both baselines are lofted that way
+    # (ConstChord 0.178 -> 0.100, Plan L 0.1774 constant), and wing 5 raises the
+    # inboard end of that without touching the outboard.
+    ax = fig.add_subplot(gs[2, 1])
+    for (nm, c, tag), r in zip(CLASSES, res):
+        m = r["mesh"] / config.SCALE
+        y = np.abs(m[0, :, 1]); yp = 0.5 * (y[:-1] + y[1:])
+        ax.plot(yp, r["toc"], color=c, lw=1.6, ls="--" if tag == "reference" else "-",
+                label=f"{nm.replace(chr(10), ' ')} ({r['toc'][0]:.3f} → {r['toc'][-1]:.3f})")
+    for ys_ in NACELLES:
+        ax.axvline(ys_, color="0.45", ls=":", lw=1.0)
+    ax.set_xlabel("y, in"); ax.set_ylabel("t/c")
+    ax.set_title("Thickness ratio t/c\n(root → tip in the legend)", fontsize=10.5)
+    ax.legend(fontsize=7.0); ax.grid(alpha=0.25)
+
+    # --- spar chord ratios. The front spar is 0.12c on every optimized design;
+    # the aft spar is the piecewise-linear schedule. Plan L has neither -- it is
+    # an as-built loft, so its ONE fitted straight spar is drawn instead and its
+    # front spar is the study's 0.12c applied for comparability, not a measurement.
+    ax = fig.add_subplot(gs[2, 2])
+    yy = REPORT_STATIONS_IN
+    ax.plot(yy, [float(rear_spar_fraction(v, schedule)) for v in yy], color="#C44E52",
+            lw=1.8, label="aft spar, scheduled (wings 3/7/8)")
+    ax.axhline(PLAN_L_AFT_PCT, color=PLAN_L_COLOR, ls="--", lw=1.6,
+               label=f"Plan L fitted straight spar ({PLAN_L_AFT_PCT:.3f}c)")
+    ax.axhline(w2.FRONT_PCT, color="k", ls="-.", lw=1.4, label=f"front spar {w2.FRONT_PCT:.2f}c (all)")
+    for ys_, lab in NACELLES.items():
+        ax.axvline(ys_, color="0.45", ls=":", lw=1.0)
+    ax.axvline(0.90 * 708.0, color="#8172B2", ls="--", lw=1.1)
+    ax.annotate("schedule breakpoints\n356 in / 674.9 in", xy=(360, 0.30), fontsize=7.2, color="0.35")
+    ax.set_ylim(0.0, 0.85); ax.set_xlabel("y, in"); ax.set_ylabel("spar station, x/c")
+    ax.set_title("Front and aft spar chord ratios", fontsize=10.5)
+    ax.legend(fontsize=7.0, loc="lower left"); ax.grid(alpha=0.25)
+
     # --- aft-spar DEPTH. The requirement the whole wing 2/3 exercise turns on:
     # depth = retention(spar x/c) * t/c * chord, so chord taken for drag is depth
     # taken from the structure.
-    ax = fig.add_subplot(gs[2, 1])
+    ax = fig.add_subplot(gs[3, 0])
     for (nm, c, tag), (y, _, depth, _) in zip(CLASSES, span):
-        ax.plot(y, depth, color=c, lw=1.6)
+        ax.plot(y, depth, color=c, lw=1.6, ls="--" if tag == "reference" else "-")
     ax.axhline(6.0, color="#C44E52", ls="--", lw=1.2)
     ax.text(5, 6.0, " 6 in required at the aileron", color="#C44E52", fontsize=7.5, va="bottom")
     ax.axvline(0.90 * 708.0, color="#8172B2", ls="--", lw=1.1)
@@ -275,12 +364,13 @@ if __name__ == "__main__":
     ax.grid(alpha=0.25)
 
     # --- wingbox WIDTH against the requirement at each station, nacelles named.
-    ax = fig.add_subplot(gs[2, 2])
+    ax = fig.add_subplot(gs[3, 1])
     for (nm, c, tag), (y, _, _, width) in zip(CLASSES, span):
-        ax.plot(y, width, color=c, lw=1.6)
+        ax.plot(y, width, color=c, lw=1.6, ls="--" if tag == "reference" else "-")
     ys_req = [s_[0] for s_ in stations]; w_req = [s_[1] for s_ in stations]
     for (nm, c, tag), r in zip(CLASSES, res):
-        ax.plot(ys_req, r["constraint_width_in"], "o", color=c, ms=5, mec="k", mew=0.6, zorder=5)
+        if r.get("constraint_width_in") is not None:
+            ax.plot(ys_req, r["constraint_width_in"], "o", color=c, ms=5, mec="k", mew=0.6, zorder=5)
     ax.plot(ys_req, w_req, "k_", ms=16, mew=2.0, label="required")
     for ys_, wr in zip(ys_req, w_req):
         lab = NACELLES.get(ys_, "")
