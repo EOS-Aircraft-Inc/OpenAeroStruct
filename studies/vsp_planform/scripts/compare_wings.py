@@ -294,6 +294,12 @@ if __name__ == "__main__":
         json.dump(weights, open(wpath, "w"), indent=2)
 
     base = cases[REFERENCE]["drag_N"]
+    # Break-even exchange rate for the range merit function: dR/R = dm_batt/m_batt
+    # - dD/D, so a design may spend BREAK_EVEN_LB_PER_N pounds of structure per
+    # newton of drag it saves. Measured at wing 3, the adopted design.
+    from studies.vsp_planform.coupling import mission as _mi
+    _w3 = cases.get("wing 3\n(6 in @ 90%)", {})
+    BREAK_EVEN_LB_PER_N = (_mi.battery_lb(_w3["w_wing_lb"]) / _w3["drag_N"]) if "w_wing_lb" in _w3 else float("nan")
     names = list(cases)
     for n in names:
         c = cases[n]
@@ -302,14 +308,14 @@ if __name__ == "__main__":
               f"{c['drag_N'] / base - 1:+7.2%}   CL {c['CL']:.4f}{wl}")
 
     # ---------------- figure ----------------
-    fig = plt.figure(figsize=(16, 11))
+    fig = plt.figure(figsize=(16, 14.5))
     fig.suptitle(
         "Plan L (reference) vs ConstChord vs wings 2–6 — drag from full OAS at MTOW 382 547 N, span pinned at "
         "118 ft, all trimmed to the same lift;\nwing weight from WingCalc sizing the same geometry. "
         "All percentages are against PLAN L.",
         fontsize=13,
     )
-    gs = fig.add_gridspec(3, 3, hspace=0.34, wspace=0.28)
+    gs = fig.add_gridspec(4, 3, hspace=0.40, wspace=0.28)
     cols = [COLORS[n] for n in names]
     # Bar charts get the short name only; the full label overlaps its neighbours.
     short = [n.split("\n")[0] for n in names]
@@ -429,6 +435,49 @@ if __name__ == "__main__":
     ax.set_ylim(0.0, 0.85)
     ax.set_xlabel("y, in"); ax.set_ylabel("spar station, x/c")
     ax.set_title("Front and aft spar chord ratios\n(as-built baselines have no scheduled box)", fontsize=11)
+
+    # ---- electric range. THE study's merit function: wing weight trades against
+    # battery at fixed MTOW, so a design is ranked by m_batt / D and not by drag.
+    # Only sized cases can appear as a bar; the panel beside it is what the rest
+    # of them can be said about without a weight.
+    from studies.vsp_planform.coupling import mission
+
+    ax = fig.add_subplot(gs[3, 0])
+    rv = [mission.electric_range_nmi(cases[n]["w_wing_lb"], cases[n]["drag_N"])
+          if "w_wing_lb" in cases[n] else None for n in names]
+    got = [r for r in rv if r is not None]
+    ax.bar(range(len(names)), [r if r is not None else 0.0 for r in rv], color=cols)
+    for i, r in enumerate(rv):
+        if r is None:
+            ax.text(i, (min(got) * 0.985 if got else 0.0), "not sized", ha="center", va="bottom",
+                    fontsize=8, rotation=90, color="0.5")
+        else:
+            ax.text(i, r + 0.3, f"{r:.1f}", ha="center", fontsize=9, fontweight="bold")
+    if got:
+        ax.set_ylim(min(got) * 0.98, max(got) * 1.02)
+    ax.set_xticks(range(len(names))); ax.set_xticklabels(short, fontsize=8.5, rotation=20, ha="right")
+    ax.set_ylabel("electric range, nmi")
+    ax.set_title(f"Electric range at fixed MTOW\n({mission.E_STAR_WH_KG:.0f} Wh/kg, eta {mission.ETA_PROP:.2f})", fontsize=11)
+    ax.grid(alpha=0.3, axis="y")
+
+    # ---- range vs wing weight. Each design is a line R(w) = eta e* m_batt(w) / D
+    # at its OWN drag, so the vertical gap between two lines at one weight is the
+    # drag penalty, and where a line crosses another is the weight that pays for
+    # it. This is the only panel that says anything about an unsized case.
+    ax = fig.add_subplot(gs[3, 1:])
+    wgrid = np.linspace(7000.0, 9600.0, 200)
+    for n in names:
+        r = np.array([mission.electric_range_nmi(w, cases[n]["drag_N"]) for w in wgrid])
+        ax.plot(wgrid, r, color=COLORS[n], lw=1.6, label=n.replace("\n", " "))
+        if "w_wing_lb" in cases[n]:
+            wl = cases[n]["w_wing_lb"]
+            ax.plot([wl], [mission.electric_range_nmi(wl, cases[n]["drag_N"])], "o",
+                    color=COLORS[n], ms=7, mec="k", mew=0.8, zorder=5)
+    ax.set_xlabel("wing weight, lb"); ax.set_ylabel("electric range, nmi")
+    ax.set_title("Electric range vs wing weight — markers are SIZED weights, lines are the same design at any weight\n"
+                 f"(break-even {BREAK_EVEN_LB_PER_N:.2f} lb per N of drag: a line crossing another is the weight that pays for its drag)",
+                 fontsize=10.5)
+    ax.legend(fontsize=8, ncol=2); ax.grid(alpha=0.3)
     ax.grid(alpha=0.3); ax.legend(fontsize=7, loc="center left", framealpha=0.9)
 
     fig.text(0.5, 0.012,
