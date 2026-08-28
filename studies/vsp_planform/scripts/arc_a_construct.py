@@ -131,6 +131,12 @@ def evaluate(taper_B, case, cmt_at, p, schedule, stations):
 
 PROBE_SCHED = ((356.0, 0.750), (674.9, 0.750))
 PROBE_ST = BASE_STATIONS + ((A.Y_AIL, 30.0), (674.9, w2.JUNCTION_BOX_IN))
+# The 7 in depth holds from ROOT TO AILERON, so it has to be checked along the span.
+# Constraining only the endpoint let Arc A dip to 5.94 in at y = 595 while the aileron
+# read exactly 7.00. RegionPlanform emits station_chord wherever it is asked, so these
+# are appended as pure REPORTING stations -- zero required width, nothing constrained.
+REPORT_Y = tuple(float(v) for v in np.linspace(40.0, A.Y_AIL, 40))
+REPORT_ST = tuple((y, 0.0) for y in REPORT_Y)
 
 
 def pass_at(taper_B, case, ret_at, cmt_at, p, K):
@@ -145,12 +151,31 @@ def pass_at(taper_B, case, ret_at, cmt_at, p, K):
     spar_ail = float(rear[3])
     ret_ail = ret_at(A.Y_AIL, spar_ail)
     c_req = A.DEPTH_REQ / (ret_ail * r0["toc_ail"])
-    st = BASE_STATIONS + ((A.Y_AIL, (spar_ail - w2.FRONT_PCT) * c_req),
-                          (674.9, w2.JUNCTION_BOX_IN))
+    st = (BASE_STATIONS + ((A.Y_AIL, (spar_ail - w2.FRONT_PCT) * c_req),
+                          (674.9, w2.JUNCTION_BOX_IN)) + REPORT_ST)
 
     r = evaluate(taper_B, case, cmt_at, p, sched, st)
+    n_con = len(BASE_STATIONS) + 2
     r["stations"] = ys
-    r["width_req_in"] = [v for _, v in st]
+    r["width_req_in"] = [v for _, v in st[:n_con]]
+    r["box_width_in"] = np.asarray(r["box_width_in"])[:n_con]
+
+    # Depth ALONG the span, from the model's own chord at the reporting stations.
+    ch_rep = np.asarray(r["station_chord_in"], dtype=float)[n_con:]
+    toc_full = np.asarray(r["toc_full"], dtype=float)
+    ymesh = np.abs(np.asarray(r["mesh"])[0, :, 1]) / config.SCALE
+    ypan = 0.5 * (ymesh[:-1] + ymesh[1:])
+    dep_span, rear_span = [], []
+    for y, c in zip(REPORT_Y, ch_rep):
+        rr = p + K / c
+        rear_span.append(rr)
+        dep_span.append(ret_at(y, rr) * float(np.interp(y, ypan, toc_full)) * c)
+    dep_span = np.array(dep_span)
+    r["depth_span_in"] = dep_span
+    r["depth_span_y"] = list(REPORT_Y)
+    r["depth_min_in"] = float(dep_span.min())
+    r["depth_min_y"] = float(REPORT_Y[int(dep_span.argmin())])
+    r["station_chord_in"] = np.asarray(r["station_chord_in"])[:n_con]
     r["rear_schedule"] = [[float(y), float(v)] for y, v in sched]
     r["spar_at_aileron"] = spar_ail
     r["retention_at_spar"] = ret_ail
@@ -213,23 +238,25 @@ if __name__ == "__main__":
     r = pass_at(t0, case, ret_at, cmt_at, p, K)
 
     def show(t, res):
-        print(f"  taper_B {t:.4f} -> depth {res['depth_in']:5.2f} in "
-              f"({res['depth_in']-A.DEPTH_REQ:+.3f}), c_ail "
-              f"{float(res['station_chord_in'][3]):5.1f} in, spar "
-              f"{res['spar_at_aileron']:.4f}c, drag {res['drag_N']:9.1f} N, "
+        print(f"  taper_B {t:.4f} -> MIN depth {res['depth_min_in']:5.2f} in at y "
+              f"{res['depth_min_y']:5.0f} ({res['depth_min_in']-A.DEPTH_REQ:+.3f}), "
+              f"aileron {res['depth_in']:5.2f}, c_ail "
+              f"{float(res['station_chord_in'][3]):5.1f} in, drag {res['drag_N']:9.1f} N, "
               f"S_ref {res['S_ref']*M2_FT2:7.1f} ft2", flush=True)
 
     show(t0, r)
-    best, d0 = r, r["depth_in"]
+    # The requirement is a FLOOR over the whole root-to-aileron span, so the MINIMUM
+    # is what has to clear it -- not the value at the aileron.
+    best, d0 = r, r["depth_min_in"]
     if d0 < A.DEPTH_REQ - a.tol:
         t1 = min(1.0, t0 * A.DEPTH_REQ / max(d0, 1e-6))
         for _ in range(8):
             r1 = pass_at(t1, case, ret_at, cmt_at, p, K)
             show(t1, r1)
             best = r1
-            if A.DEPTH_REQ <= r1["depth_in"] <= A.DEPTH_REQ + a.tol:
+            if A.DEPTH_REQ <= r1["depth_min_in"] <= A.DEPTH_REQ + a.tol:
                 break
-            d1 = r1["depth_in"]
+            d1 = r1["depth_min_in"]
             if abs(d1 - d0) < 1e-9:
                 break
             t_new = t1 + (A.DEPTH_REQ - d1) * (t1 - t0) / (d1 - d0)
@@ -246,9 +273,11 @@ if __name__ == "__main__":
             viol.append(round(y, 1))
         print(f"  y {y:7.1f}  box {got:6.2f} in  need {req:6.2f}  "
               f"{'ok      ' if ok else 'VIOLATED'}  {tag}")
-    dep_ok = best["depth_in"] >= A.DEPTH_REQ - a.tol
-    print(f"  depth at the aileron {best['depth_in']:5.2f} in  need {A.DEPTH_REQ:.2f}  "
+    dep_ok = best["depth_min_in"] >= A.DEPTH_REQ - a.tol
+    print(f"  depth, MINIMUM root->aileron {best['depth_min_in']:5.2f} in at y "
+          f"{best['depth_min_y']:.0f}   need {A.DEPTH_REQ:.2f}  "
           f"{'ok' if dep_ok else 'VIOLATED'}")
+    print(f"  depth at the aileron itself  {best['depth_in']:5.2f} in")
     print(f"  aft spar straightness: the spar's offset from the construction line "
           f"varies by {best['x_aft_spread_in']:.4f} in (0 = perfectly straight)")
 

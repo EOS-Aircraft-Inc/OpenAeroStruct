@@ -216,7 +216,19 @@ def blended_section(name_in, name_out, f0, f1, semi_in=SEMI_IN):
 # (5.1% of semi-span) with only 8.3% of the planform area outboard of it.
 # 562.5 in (79.4%, a 74.7 in loft) is the fallback if the aero side wants a gentler
 # spanwise pressure transition; it costs L/D over 12.2% of the area instead of 8.3%.
-_BLEND_START_IN = 601.0
+# 524.0 in (74.0% semi, a rib station), NOT as late as possible. Starting the blend
+# later fails the requirement: the 7 in depth holds from ROOT TO AILERON, not merely
+# AT the aileron, and the straight aft spar pushes the spar aft in chord fraction as
+# the chord shrinks -- 0.750c at the root, 0.784c by y = 600 -- where e694 retains only
+# ~0.58. Between the point the spar gets too far aft and the point the blend arrives,
+# depth collapses. Measured minima over root->aileron:
+#       start 601.0 in  ->  5.80 in at y = 601   (73 in of span below 7)
+#       start 562.5 in  ->  6.80 in at y = 565
+#       start 524.0 in  ->  6.84 in at y = 637   the dip is gone; the AILERON binds
+# Once the minimum lands at the aileron, taper_B can lift the whole curve. It costs
+# L/D over 16.6% of the planform area instead of 8.3%, which is the price of the
+# requirement being a span, not a station.
+_BLEND_START_IN = 524.0
 SECTION_BLEND = {
     "A": ("e694", "goe16k", _BLEND_START_IN / SEMI_IN, 0.90),
 }
