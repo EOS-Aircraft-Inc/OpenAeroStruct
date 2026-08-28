@@ -53,6 +53,9 @@ sys.path.insert(0, os.path.dirname(_HERE))
 sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(_HERE), "..", "..", "..")))
 
 from studies.vsp_planform import config, param                       # noqa: E402
+from studies.vsp_planform.degen_csv import read_degen_csv, lifting_surfaces  # noqa: E402
+from studies.vsp_planform.coupling import deck as wcdeck              # noqa: E402
+from studies.vsp_planform.coupling import mission                     # noqa: E402
 import studies.vsp_planform.run_opt as ro                            # noqa: E402
 from studies.vsp_planform.run_opt import POINT, trim_alpha           # noqa: E402
 import wing2_oas as w2                                               # noqa: E402
@@ -122,6 +125,7 @@ def evaluate(taper_B, case, cmt_at, p, schedule, stations):
     r["twist_cp"] = prob.get_val("wing.twist_cp", units="deg").tolist()
     r["t_over_c_cp"] = cp.tolist()
     r["toc_full"] = toc
+    r["mesh"] = np.asarray(prob.get_val("wing.mesh", units="m"))
     return r
 
 
@@ -262,6 +266,42 @@ if __name__ == "__main__":
         print(f"  NOT FEASIBLE -- width violated at y = {viol}" if viol
               else "  NOT FEASIBLE -- depth short")
 
+    # ---- weight, so this design can stand beside B and C on the merit function ----
+    # Same damped bi-level fixed point arc_optimal_toc uses, and the same deck.
+    w_wing = batt = rng = None
+    hist, sizing_error = [], None
+    if not (viol or not dep_ok):
+        comp = list(lifting_surfaces(read_degen_csv(
+            config.BASELINES[w2.BASELINE])).values())[0][0]
+        oas = {"mesh": best["mesh"], "toc": best["toc_full"],
+               "plate": comp.plate, "stick": comp.stick, "y_junction": 674.9}
+        w = A.W_SEED_LB
+        passes = int(os.environ.get("ARC_W_PASSES", "8"))
+        from pathlib import Path
+        for i in range(1, passes + 1):
+            print(f"  weight pass {i}: W_in {w:.1f} lb", flush=True)
+            try:
+                wcdeck.write_deck(wcdeck.WC_DECK, Path(LOGS) / "deck_arcA_constructed",
+                                  mission.MTOW_LB, w, oas=oas)
+                w_new = wcdeck.run_wingcalc(Path(LOGS) / "deck_arcA_constructed",
+                                            Path(LOGS) / "wc_arcA_constructed")
+            except Exception as exc:
+                sizing_error = f"{type(exc).__name__}: {exc}"
+                print(f"  !!! sizing FAILED: {sizing_error}", flush=True)
+                break
+            hist.append({"pass": i, "w_in_lb": w, "w_wing_lb": w_new,
+                         "residual_lb": w_new - w})
+            print(f"  >>> p{i}: {w:.1f} -> {w_new:.1f} lb ({w_new - w:+.1f})", flush=True)
+            if abs(w_new - w) < A.W_TOL_LB:
+                break
+            w += 0.5 * (w_new - w)
+        if hist:
+            w_wing = hist[-1]["w_wing_lb"]
+            batt = mission.battery_lb(w_wing)
+            rng = mission.electric_range_nmi(w_wing, best["drag_N"])
+            print(f"\n  W_wing {w_wing:.1f} lb, battery {batt:.1f} lb, "
+                  f"range {rng:.1f} nmi", flush=True)
+
     out = os.path.join(LOGS, f"arc_a_constructed_{a.profile}_{a.airfoil}.json")
     ser = {k: (v.tolist() if hasattr(v, "tolist") else v)
            for k, v in best.items() if not k.startswith("_")}
@@ -269,6 +309,19 @@ if __name__ == "__main__":
                 "constructed": True, "straight_aft_spar": True,
                 "section_blend": {"inboard": n_in, "outboard": n_out,
                                   "f_start": f0, "f_end": f1},
-                "feasible": bool(not viol and dep_ok)})
+                "feasible": bool(not viol and dep_ok),
+                # the schema arc_optimal_toc writes, so downstream needs no special case
+                "depth_delivered_in": best["depth_in"],
+                "chord_at_aileron_in": float(best["station_chord_in"][3]),
+                "toc_delivered_ail": best["toc_ail"],
+                "toc_root": float(best["toc_full"][0]),
+                "toc_tip": float(best["toc_full"][-1]),
+                "root_toc_req": cp_toc[0], "ratio_req": cp_toc[1],
+                "depth_req_in": A.DEPTH_REQ,
+                "w_wing_lb": w_wing, "batt_lb": batt, "R_nmi": rng,
+                "weight_history": hist, "sizing_error": sizing_error,
+                "converged": bool(hist) and abs(hist[-1]["residual_lb"]) < A.W_TOL_LB,
+                "success": True})
+    ser.pop("mesh", None)          # large, and downstream replays the design instead
     json.dump(ser, open(out, "w"), indent=2)
     print(f"  wrote {out}")

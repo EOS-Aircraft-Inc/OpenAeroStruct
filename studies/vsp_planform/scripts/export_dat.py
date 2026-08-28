@@ -97,7 +97,27 @@ def database_profile(name, x_grid):
     return cam, t
 
 
-def export(mesh_m, toc, name, geom_id, out_dir, n_x=201, dir_hint=None, airfoil=None):
+def blended_profile(blend, x_grid):
+    """Camber and thickness of a SPANWISE section pair, as functions of y (inches).
+
+    A real lofted wing interpolates between two defining sections, so both camber and
+    thickness are blended; the thickness is then scaled to the station's t/c by the
+    caller, which is what preserves c_max_t and the retention curve.
+    """
+    cam_i, t_i = database_profile(blend["inboard"], x_grid)
+    cam_o, t_o = database_profile(blend["outboard"], x_grid)
+    f0, f1 = float(blend["f_start"]), float(blend["f_end"])
+    semi = 708.0
+
+    def at(y_in):
+        w = float(np.clip((abs(y_in) / semi - f0) / (f1 - f0), 0.0, 1.0))
+        return (1.0 - w) * cam_i + w * cam_o, (1.0 - w) * t_i + w * t_o
+
+    return at
+
+
+def export(mesh_m, toc, name, geom_id, out_dir, n_x=201, dir_hint=None, airfoil=None,
+           blend=None):
     """Write <name>_af.csv plus one .dat per spanwise station. Returns the paths."""
     out_dir.mkdir(parents=True, exist_ok=True)
     comp = list(lifting_surfaces(read_degen_csv(config.BASELINES[w2.BASELINE])).values())[0][0]
@@ -121,10 +141,17 @@ def export(mesh_m, toc, name, geom_id, out_dir, n_x=201, dir_hint=None, airfoil=
     # A named section is the same shape at every station, so its camber and
     # thickness are built once; only the t/c scale changes down the span.
     db = None if airfoil in (None, "", "as-built") else database_profile(airfoil, x_grid)
+    # A spanwise pair overrides the single section: the contour changes down the span.
+    db_at = blended_profile(blend, x_grid) if blend else None
     blocks, dats = [], []
     for i in range(ny):
         f = 0.0 if span1 == span0 else (ws[i] - span0) / (span1 - span0)
-        if db is not None:
+        if db_at is not None:
+            # lofted between two sections, then thickness-scaled to this station's t/c
+            cam, t_n = db_at(ws[i])
+            k = float(toc_node[i]) / float(t_n.max())
+            up, lo = cam + 0.5 * t_n * k, cam - 0.5 * t_n * k
+        elif db is not None:
             # thickness scaled to this station's t/c, camber untouched -- keeps
             # c_max_t and the retention curve, which is why this section was picked
             cam, t_n = db
@@ -171,6 +198,20 @@ def load_design(arc):
     # exported from the wrong section would carry the wrong contours entirely.
     airfoil = os.environ.get("ARC_AIRFOIL", "e694")
     sfx = "" if airfoil in ("", "as-built") else f"_{airfoil}"
+    # Arc A is CONSTRUCTED, not optimized: its straight aft spar is a geometric
+    # requirement, built to rather than searched for. Never export one that failed
+    # its own constraints.
+    if arc == "A":
+        for prof in ("optimal", "capped"):
+            pc = LOGS / f"arc_a_constructed_{prof}{sfx}.json"
+            if pc.exists():
+                case = json.loads(pc.read_text())
+                if case.get("feasible"):
+                    r = replay(case, y_a, rule)
+                    return (r["mesh"], r["toc"], case.get("airfoil") or "as-built",
+                            f"{pc.name} ({prof} t/c, CONSTRUCTED straight aft spar)",
+                            case)
+                print(f"  NOTE: {pc.name} is not feasible -- not exported")
     for prof in ("optimal", "capped"):
         p = LOGS / f"arc_optimal_toc_{arc}_{prof}{sfx}.json"
         if p.exists():
@@ -206,6 +247,9 @@ def write_readme(path, arc, case, prov, n_stations, n_x):
     hist = case.get("weight_history") or []
     resid = hist[-1]["residual_lb"] if hist else None
     sec = case.get("airfoil") or "as-built"
+    blend = case.get("section_blend")
+    sched = case.get("rear_schedule")
+    constructed = bool(case.get("constructed"))
     lines = [
         f"Arc {arc} -- {ARCH_NOTE.get(arc, '')}",
         "=" * 72,
@@ -220,15 +264,53 @@ def write_readme(path, arc, case, prov, n_stations, n_x):
         "  the upper surface to the leading edge, then lower surface back. Leading /",
         "  Trailing Edge Point and Chord in _af.csv are INCHES in the aircraft frame.",
         "",
+        "HOW THIS DESIGN WAS PRODUCED",
+        ("  CONSTRUCTED, not drag-optimized. Its straight aft spar is a geometric\n"
+         "  requirement, so the design is built to satisfy the constraints rather than\n"
+         "  searched for: the twist and alpha come from the optimized Arc A and the\n"
+         "  taper is solved on the 7 in aileron depth. Its drag is therefore FEASIBLE,\n"
+         "  not best-in-class, and is about 0.5% above the drag-optimal Arc A that had\n"
+         "  a kinking aft spar. Do not read it as an architecture comparison."
+         if constructed else
+         "  Drag-optimized within its constraint class (OAS, SLSQP): minimum drag at\n"
+         "  MTOW subject to the box-width requirements, trim, and an area floor."),
+        "",
+    ] + ([
+        "AFT SPAR -- STRAIGHT",
+        f"  rear(y) = p + K/c(y) with p = {case.get('wingbox_pct', float('nan')):.4f} and "
+        f"K = {case.get('K_in', float('nan')):.2f} in,",
+        "  which puts the spar at CONSTANT x from root to winglet junction. Verified on",
+        f"  the built geometry: its offset from the construction line varies by "
+        f"{case.get('x_aft_spread_in', float('nan')):.4f} in.",
+        "  K is set by the hardest-binding box-width station, not chosen.",
+        "  Consequence worth knowing: constant x is a LARGER chord fraction where the",
+        "  chord is smaller, so the spar moves aft in section terms going outboard --",
+        f"  {sched[0][1]:.3f}c at the root to {sched[-1][1]:.3f}c at the junction. That is"
+        f" why the",
+        "  aileron depth had to be bought back with chord.",
+        "",
+    ] if (constructed and sched) else []) + [
         "SECTION",
+    ] + ([
+        f"  SPANWISE: {blend['inboard']} inboard, blending to {blend['outboard']} between",
+        f"  {blend['f_start']*708.0:.0f} in and {blend['f_end']*708.0:.0f} in "
+        f"({blend['f_start']:.0%}-{blend['f_end']:.0%} semi-span).",
+        "  Camber and thickness are lofted linearly between the two; the thickness is",
+        "  then scaled to each station's t/c with the camber left alone.",
+        f"  Why: at the far-aft spar this design carries, {blend['inboard']} keeps only",
+        f"  0.640 of its thickness while {blend['outboard']} keeps 0.811, and outboard of",
+        f"  {blend['f_start']:.0%} semi-span there is little area for its poorer L/D to be paid on.",
+        f"  Retention at the aileron spar: {case.get('retention_at_spar', float('nan')):.4f}",
+    ] if blend else [
         f"  {sec}, thickness-scaled to each station's t/c with the CAMBER LEFT ALONE.",
         f"  c_max_t {case.get('c_max_t', float('nan')):.4f}"
-        f"   thickness retention at the 0.574c aft spar {case.get('retention_at_spar', float('nan')):.4f}",
+        f"   thickness retention at the aft spar {case.get('retention_at_spar', float('nan')):.4f}",
         "  Scaling thickness only is deliberate: it preserves c_max_t and the",
         "  retention curve, and retention is why this section was chosen (it keeps",
         "  0.935 of its thickness at the spar where the as-built loft keeps 0.814).",
         "  It is NOT a section designed at these thicknesses -- it is this section",
         "  scaled to them.",
+    ]) + [
         "",
         "THICKNESS PROFILE",
         f"  root t/c {case.get('toc_root', float('nan')):.4f} -> tip {case.get('toc_tip', float('nan')):.4f}"
@@ -239,7 +321,8 @@ def write_readme(path, arc, case, prov, n_stations, n_x):
         f"  drag            {case.get('drag_N', float('nan')):9.1f} N   "
         f"(induced {case.get('induced_N', float('nan')):.1f}, viscous {case.get('viscous_N', float('nan')):.1f}, wave {case.get('wave_N', 0.0):.1f})",
         f"  S_ref           {case.get('S_ref', float('nan')) * 10.7639104:9.1f} ft2",
-        f"  aft-spar depth  {case.get('depth_delivered_in', float('nan')):9.2f} in delivered at the aileron (6.00 required)",
+        f"  aft-spar depth  {case.get('depth_delivered_in', float('nan')):9.2f} in delivered "
+        f"at the aileron ({case.get('depth_req_in', 7.0):.2f} required)",
         f"  wing weight     {(f'{w:9.1f} lb' if w else '  UNSIZED')}"
         f"{'' if w is None else ('   CONVERGED' if conv else '   NOT CONVERGED')}"
         f"{'' if resid is None else f' (residual {resid:+.1f} lb, tolerance 25)'}",
@@ -249,10 +332,11 @@ def write_readme(path, arc, case, prov, n_stations, n_x):
         "  * Drag is WING-ONLY. Absolutes understate aircraft drag and overstate",
         "    range; the comparisons between arcs are the point, not the absolutes.",
         "  * The t/c profile was optimised against the AS-BUILT section's retention",
-        "    (0.814 at the spar) and then applied to this section (0.935). Retention",
-        "    sets c_req = depth / (retention * t/c) and therefore chord, area and",
-        "    weight, so this profile is applied, NOT jointly optimised with the",
-        "    section. It is the largest open item on this geometry.",
+        "    (0.814 at a 0.574c spar) and then applied to this design, whose retention",
+        f"    at its own spar is {case.get('retention_at_spar', float('nan')):.4f}. Retention sets",
+        "    c_req = depth / (retention * t/c) and therefore chord, area and weight, so",
+        "    this profile is APPLIED, not jointly optimised with the section. It is the",
+        "    largest open item on this geometry.",
         "  * The wing is SIZED at MTOW but FLOWN at mid-cruise weight.",
         "  * Weight comes from WingCalc through a damped bi-level fixed point. Where",
         "    it says NOT CONVERGED the loop hit its pass limit; the value is close",
@@ -276,7 +360,8 @@ if __name__ == "__main__":
         mesh, toc, sec, prov, case = load_design(arc)
         work = GEOMS / name
         csv_path, dats = export(mesh, toc, name, GEOM_ID[arc], work,
-                                n_x=a.n_x, airfoil=sec)
+                                n_x=a.n_x, airfoil=sec,
+                                blend=case.get("section_blend"))
         rd = write_readme(work / f"{name}_README.txt", arc, case, prov,
                           len(dats), a.n_x)
         zpath = GEOMS / f"{name}.zip"

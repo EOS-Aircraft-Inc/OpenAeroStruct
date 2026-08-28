@@ -81,7 +81,7 @@ Y_JUNCTION_IN = 674.9
 DEPTH_REQ_IN = 7.0
 
 
-def retention_fn(airfoil=None):
+def retention_fn(airfoil=None, blend=None):
     """Fraction of max thickness a section still has at x/c.
 
     Retention belongs to the SECTION, and it is what turns t/c into depth:
@@ -90,14 +90,32 @@ def retention_fn(airfoil=None):
     the 7.65 in the design actually delivers, because e694 keeps 0.935 of its
     thickness at the 0.574c spar where the as-built keeps 0.814.
     """
-    if airfoil in (None, "", "as-built"):
-        af = asbuilt()
-    else:
-        import aerosandbox as asb
-        af = asb.Airfoil(airfoil)
+    def _thk(name):
+        if name in (None, "", "as-built"):
+            af = asbuilt()
+        else:
+            import aerosandbox as asb
+            af = asb.Airfoil(name)
+        return np.array([float(af.local_thickness(x_over_c=float(x))) for x in xs])
+
     xs = np.linspace(0.05, 0.95, 300)
-    t = np.array([float(af.local_thickness(x_over_c=x)) for x in xs])
-    return lambda x: float(np.interp(x, xs, t / t.max()))
+    # A design may carry a SPANWISE section, in which case retention is a function
+    # of the station as well as the chord fraction. Returned with the same (y, spar)
+    # signature either way so callers need no special case.
+    if blend:
+        t_in, t_out = _thk(blend["inboard"]), _thk(blend["outboard"])
+        f0, f1 = float(blend["f_start"]), float(blend["f_end"])
+        semi = 708.0
+
+        def _ret(y_in, spar):
+            w = float(np.clip((abs(y_in) / semi - f0) / (f1 - f0), 0.0, 1.0))
+            t = (1.0 - w) * t_in + w * t_out
+            return float(np.interp(spar, xs, t / t.max()))
+
+        return _ret
+
+    t = _thk(airfoil)
+    return lambda y_in, spar: float(np.interp(spar, xs, t / t.max()))
 
 
 # Where the box is reported. RegionPlanform emits `station_chord` at whatever
@@ -108,6 +126,21 @@ def retention_fn(airfoil=None):
 # and the spanwise stations are clustering into the winglet; that error reads as
 # a violated constraint on a design the optimizer has satisfied.
 REPORT_STATIONS_IN = np.linspace(0.0, 674.9, 80)
+
+
+def rear_fraction(r, y_in, chord_in, schedule):
+    """This design's aft-spar chord fraction at these stations.
+
+    A straight aft spar is rear(y) = p + K/c(y), which is NOT linear in y, so
+    interpolating a handful of stored knots bows it between them. When the design
+    carries K the rule is used directly and the spar is straight everywhere, not
+    just at the stations the knots were placed on.
+    """
+    K = r.get("K_in")
+    if K is not None:
+        p_ = float(r["wingbox_pct"])
+        return np.array([p_ + float(K) / float(c) for c in chord_in])
+    return np.array([float(rear_spar_fraction(v, schedule)) for v in y_in])
 
 
 def spanwise(r, schedule, ret):
@@ -123,13 +156,14 @@ def spanwise(r, schedule, ret):
         m0 = r["mesh"] / config.SCALE
         y0 = np.abs(m0[0, :, 1]); yp0 = 0.5 * (y0[:-1] + y0[1:])
         toc0 = np.interp(y, yp0, r["toc"])
-        return y, chord, np.array([ret(v) for v in sp]) * toc0 * chord, (sp - w2.FRONT_PCT) * chord
+        return (y, chord, np.array([ret(yy, v) for yy, v in zip(y, sp)]) * toc0 * chord,
+                (sp - w2.FRONT_PCT) * chord)
     m = r["mesh"] / config.SCALE
     y_mesh = np.abs(m[0, :, 1])
     yp = 0.5 * (y_mesh[:-1] + y_mesh[1:])
     toc = np.interp(y, yp, r["toc"])
-    sp = np.array([float(rear_spar_fraction(v, schedule)) for v in y])
-    depth = np.array([ret(v) for v in sp]) * toc * chord
+    sp = rear_fraction(r, y, chord, schedule)
+    depth = np.array([ret(yy, v) for yy, v in zip(y, sp)]) * toc * chord
     width = (sp - w2.FRONT_PCT) * chord
     return y, chord, depth, width
 
@@ -194,6 +228,13 @@ STRAIGHT_LINE_KEY = "wingbox_pct"
 def replay(case, y_a_in, rule):
     """Rebuild a stored case and confirm it reproduces its logged drag."""
     schedule, stations, _ = stations_and_schedule()
+    # A design may carry its own rear-spar schedule -- Arc A's straight aft spar is
+    # rear(y) = p + K/c(y), which is neither the shared kink nor a constant -- and its
+    # own SPANWISE section. Replaying either on the study defaults reproduces a
+    # different wing, which is what the drag cross-check at the end of this function
+    # exists to catch.
+    if case.get("rear_schedule"):
+        schedule = tuple((float(a_), float(b_)) for a_, b_ in case["rear_schedule"])
     w2.REAR_SCHEDULE, w2.WIDTH_STATIONS = schedule, stations
     config.WINGBOX_FRONT_PCT = w2.FRONT_PCT
     config.WINGBOX_REAR_SCHEDULE = schedule
@@ -211,7 +252,34 @@ def replay(case, y_a_in, rule):
     # 252 N discrepancy on Arc C, which the drag cross-check below catches.
     orig_build_surface = ro.build_surface
     c_max_t = case.get("c_max_t")
-    if c_max_t is not None:
+    blend = case.get("section_blend")
+    if blend:
+        # A spanwise section reaches OAS as a per-PANEL c_max_t. OAS takes an array
+        # here with no change: a constant array reproduces the scalar exactly and the
+        # analytic partials still match complex-step to 1e-19.
+        import aerosandbox as asb
+        _xs = np.linspace(0.05, 0.95, 300)
+
+        def _t(nm):
+            af = asbuilt() if nm in (None, "", "as-built") else asb.Airfoil(nm)
+            return np.array([float(af.local_thickness(x_over_c=float(x))) for x in _xs])
+
+        _ti, _to = _t(blend["inboard"]), _t(blend["outboard"])
+        _f0, _f1 = float(blend["f_start"]), float(blend["f_end"])
+
+        def _cmt(y_in):
+            w = float(np.clip((abs(y_in) / 708.0 - _f0) / (_f1 - _f0), 0.0, 1.0))
+            tt = (1.0 - w) * _ti + w * _to
+            return float(_xs[int(np.argmax(tt))])
+
+        def _surface(mesh_, stick_, regions_, **kw):
+            sd = orig_build_surface(mesh_, stick_, regions_, **kw)
+            ym = np.abs(np.asarray(mesh_)[0, :, 1]) / config.SCALE
+            yp = 0.5 * (ym[:-1] + ym[1:])
+            sd["c_max_t"] = np.array([_cmt(v) for v in yp])
+            return sd
+        ro.build_surface = _surface
+    elif c_max_t is not None:
         def _surface(mesh_, stick_, regions_, **kw):
             sd = orig_build_surface(mesh_, stick_, regions_, **kw)
             sd["c_max_t"] = float(c_max_t)
@@ -270,6 +338,18 @@ if __name__ == "__main__":
     suffix = "" if ARC_AIRFOIL in ("", "as-built") else f"_{ARC_AIRFOIL}"
 
     def arc_case(arc, fallback_file, fallback_key):
+        # Arc A is CONSTRUCTED, not optimized: its straight aft spar is a geometric
+        # requirement and the design is built to satisfy it rather than searched for.
+        # Preferred when present and feasible; a design that failed its own
+        # constraints must never silently become the figure.
+        p_con = os.path.join(LOGS, f"arc_a_constructed_{TOC_PROFILE}{suffix}.json")
+        if arc == "A" and os.path.exists(p_con):
+            c = json.load(open(p_con))
+            if c.get("feasible"):
+                return c, (f"{ARC_AIRFOIL}->{c['section_blend']['outboard']}, "
+                           f"{TOC_PROFILE} t/c, CONSTRUCTED straight aft spar")
+            print(f"  NOTE: {os.path.basename(p_con)} is not feasible -- Arc A falls "
+                  f"back to the optimized kinked-spar design point")
         p_arc = os.path.join(LOGS, f"arc_optimal_toc_{arc}_{TOC_PROFILE}{suffix}.json")
         if os.path.exists(p_arc):
             c = json.load(open(p_arc))
@@ -302,6 +382,14 @@ if __name__ == "__main__":
         _r["R_nmi"] = _c.get("R_nmi")
         _r["w_converged"] = bool(_c.get("converged"))
         _r["sizing_error"] = _c.get("sizing_error")
+        # The design's OWN spar schedule and section have to travel with it, not
+        # just be used inside replay(). Without these the panels fall back to the
+        # SHARED 0.750 -> 0.550 kink and the single-section retention, which drew
+        # Arc A's straight aft spar as a kinked one -- the model was right and the
+        # picture was wrong, which is the worse way round.
+        _r["rear_schedule"] = _c.get("rear_schedule")
+        _r["section_blend"] = _c.get("section_blend")
+        _r["constructed"] = bool(_c.get("constructed"))
 
     TOC_NOTE = provC
     print("  evaluating Plan L as-built (the reference) ...")
@@ -325,7 +413,7 @@ if __name__ == "__main__":
         return tuple((float(a_), float(b_)) for a_, b_ in sc) if sc else schedule
 
     # one retention curve per case, from that design's own section
-    rets = [retention_fn(r.get("airfoil")) for r in res]
+    rets = [retention_fn(r.get("airfoil"), r.get("section_blend")) for r in res]
     span = [spanwise(r, sched_of(r), rt) for r, rt in zip(res, rets)]
 
     fig = plt.figure(figsize=(16.5, 23))
@@ -442,20 +530,19 @@ if __name__ == "__main__":
     # front spar is the study's 0.12c applied for comparability, not a measurement.
     ax = fig.add_subplot(gs[2, 2])
     yy = REPORT_STATIONS_IN
-    sched = np.array([float(rear_spar_fraction(v, schedule)) for v in yy])  # shared (B/C)
-    # A, B and C are built to the SAME box -- front 0.12c, aft 0.750c held to
-    # 356 in then kinking to 0.550c at the junction -- so their spar lines
-    # coincide exactly. Staggered dashes draw all four rather than hiding three
-    # under one curve. Plan L has no scheduled box at all: one fitted straight
-    # spar, and a front spar that is the study's 0.12c applied for comparability.
+    # EACH design's own aft spar. B and C share the 0.750c-to-0.550c kink and so
+    # coincide; Arc A's straight aft spar goes the OTHER WAY -- constant x means a
+    # RISING chord fraction as the chord shrinks, 0.750c to 0.804c -- and drawing it
+    # on the shared schedule showed a spar it does not have.
     dashes = [(1, 0), (6, 3), (2, 2.5), (5, 2)]
-    for (nm, c, tag), dash, r in zip(CLASSES, dashes, res):
-        lbl = nm
+    for (nm, c, tag), dash, (r, sp) in zip(CLASSES, dashes, zip(res, span)):
         if tag == "reference":
             ax.plot(yy, np.full_like(yy, PLAN_L_AFT_PCT), color=c, lw=2.0, dashes=dash,
-                    label=lbl)
+                    label=nm)
         else:
-            ax.plot(yy, sched, color=c, lw=1.9, dashes=dash, label=lbl)
+            rear = rear_fraction(r, sp[0], sp[1], sched_of(r))
+            ax.plot(sp[0], rear, color=c, lw=1.9, dashes=dash,
+                    label=nm + (" (straight)" if r.get("K_in") is not None else ""))
         ax.plot(yy, np.full_like(yy, w2.FRONT_PCT), color=c, lw=1.4, dashes=dash, alpha=0.85)
     # the straight line each architecture is actually built around
     for (nm, c, tag), r in zip(CLASSES, res):
@@ -485,10 +572,10 @@ if __name__ == "__main__":
     ax.text(5, DEPTH_REQ_IN, f" {DEPTH_REQ_IN:.0f} in required at the aileron",
             color="#C44E52", fontsize=7.5, va="bottom")
     ax.set_ylim(bottom=min(DEPTH_REQ_IN - 0.6, ax.get_ylim()[0]))
-    # The aileron line stays on THIS panel only: 637.2 in is the aileron's
-    # outboard end, which is where the depth floor binds and where the markers
-    # below are plotted. Every other panel marks the winglet junction instead.
-    ax.axvline(0.90 * 708.0, color="#8172B2", ls="--", lw=1.1)
+    # Only the winglet junction is marked, here as everywhere: it is where the box
+    # ends, which is a boundary every spanwise panel shares. The aileron station is
+    # still identified -- by the markers below, which sit on it -- so it does not
+    # need a rule of its own.
     ax.axvline(Y_JUNCTION_IN, color="#0B7A75", ls="--", lw=1.1)
     for ys_ in NACELLES:
         ax.axvline(ys_, color="0.45", ls=":", lw=1.0)
@@ -616,7 +703,7 @@ if __name__ == "__main__":
         x_le, x_te = m[0, keep, 0], m[-1, keep, 0]
         chord = x_te - x_le
         pct = float(r[STRAIGHT_LINE_KEY])
-        sp_aft = np.array([float(rear_spar_fraction(v, sched_of(r))) for v in y])
+        sp_aft = rear_fraction(r, y, chord, sched_of(r))
         x_fwd = x_le + w2.FRONT_PCT * chord
         x_aft = x_le + sp_aft * chord
 
@@ -650,8 +737,12 @@ if __name__ == "__main__":
         ax.set_xlabel("y, in")
         if col == 0:
             ax.set_ylabel("x, in")
-        held = ("front spar held straight" if abs(pct - w2.FRONT_PCT) < 1e-6
-                else f"straight at {pct:.3f}c, aft side")
+        if r.get("K_in") is not None:
+            held = f"STRAIGHT aft spar (x varies {np.ptp(x_aft):.2f} in)"
+        elif abs(pct - w2.FRONT_PCT) < 1e-6:
+            held = "front spar held straight"
+        else:
+            held = f"straight line at {pct:.3f}c, aft side"
         ax.set_title(f"{nm} wingbox in plan — {held}", fontsize=10)
         ax.legend(fontsize=6.8, loc="upper left"); ax.grid(alpha=0.22)
 
@@ -659,7 +750,11 @@ if __name__ == "__main__":
                  "span pinned at 118 ft, all trimmed to the same lift\n"
                  f"Arc A / B / C carry the {TOC_NOTE} profile; Plan L is the as-built loft",
                  fontsize=12)
-    fig.text(0.5, 0.058, DEFINITIONS, ha="center", fontsize=10, fontweight="bold")
+    _con = [nm for (nm, _c, _t), r in zip(CLASSES, res) if r.get("constructed")]
+    _note = DEFINITIONS + (
+        f"    |    {', '.join(_con)} CONSTRUCTED to a straight aft spar, not "
+        f"drag-optimized -- its drag is feasible, not best-in-class." if _con else "")
+    fig.text(0.5, 0.058, _note, ha="center", fontsize=10, fontweight="bold")
     fig.text(0.5, 0.028,
              "All percentages are against PLAN L AS-BUILT. Drag is NOT the merit function: the study ranks on electric range at fixed MTOW (m_batt/D), break-even "
              f"{BREAK_EVEN_LB_PER_N:.3f} lb of wing per newton,\nso 'may weigh' is how much heavier each architecture can be and still match Plan L on range -- and the bottom row now plots that range directly. "

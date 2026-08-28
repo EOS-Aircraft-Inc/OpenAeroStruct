@@ -259,7 +259,12 @@ if __name__ == "__main__":
     }
     for _arc in sorted(ARC_SPEC):
         _y_a, _rule = ARC_SPEC[_arc]
+        # Arc A is CONSTRUCTED to its straight-aft-spar requirement rather than
+        # optimized, so its own design point wins where it exists and is feasible.
         _p = Path(LOGS) / f"arc_optimal_toc_{_arc}_{ARC_PROFILE}{_sfx}.json"
+        _pc = Path(LOGS) / f"arc_a_constructed_{ARC_PROFILE}{_sfx}.json"
+        if _arc == "A" and _pc.exists() and json.loads(_pc.read_text()).get("feasible"):
+            _p = _pc
         if not _p.exists():
             print(f"  NOTE: {_p.name} absent -- Arc {_arc} left off the figure")
             continue
@@ -277,12 +282,16 @@ if __name__ == "__main__":
         _r["schedule"] = (tuple((float(u), float(v)) for u, v in _sc) if _sc
                           else _arc_schedule)
         _r["CL"] = _c.get("CL")
+        _r["section_blend"] = _c.get("section_blend")
+        _r["K_in"] = _c.get("K_in")
         if _c.get("w_wing_lb"):
             _r["w_wing_lb"] = float(_c["w_wing_lb"])
         else:
             print(f"    Arc {_arc} has no sized weight ({str(_c.get('sizing_error'))[:60]});"
                   f" drawn as 'not sized'")
-        _key = f"Arc {_arc}\n({ARC_PROFILE} t/c, {ARC_AIRFOIL})"
+        _tag = ("straight aft spar" if _c.get("straight_aft_spar")
+                else f"{ARC_PROFILE} t/c, {ARC_AIRFOIL}")
+        _key = f"Arc {_arc}\n({_tag})"
         cases[_key] = _r
         COLORS[_key] = ARC_COLORS[_arc]
 
