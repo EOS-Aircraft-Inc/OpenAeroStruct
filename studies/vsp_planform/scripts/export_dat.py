@@ -14,12 +14,27 @@ XSecSurf ID, FoilSurf u Value, Global u Value -- so the file is interchangeable
 with a genuine VSP export rather than merely sufficient.
 
 WHERE THE SHAPE COMES FROM. Not from OAS: its mesh is a camber surface and it
-knows a section only as t/c and c_max_t. Contours come from the BASELINE
-DegenGeom's plate (zCamber and t, normalized by chord), blended between
-bracketing baseline sections and rescaled to the design's local t/c. So a design
-carrying root t/c 0.25 exports the as-built section SCALED to 0.25, not a section
-designed at 0.25. That is the study's own assumption; it is not extra licence
-taken here, but it must travel with the file.
+knows a section only as t/c and c_max_t.
+
+  a design on a DATABASE SECTION (--airfoil e694, the default) exports THAT
+  section's own contour, thickness-scaled to the design's local t/c with the
+  camber left alone. Scaling thickness only is what keeps the two things the
+  study actually used -- c_max_t, and the thickness RETENTION at the spar -- and
+  both are properties of where the thickness sits, so a bodily y-scale would
+  preserve them while a reshaping would not.
+
+  a design on the AS-BUILT loft exports the baseline DegenGeom's plate (zCamber
+  and t, normalized by chord), blended between bracketing baseline sections and
+  scaled bodily to the design's local t/c. So it exports the as-built section
+  SCALED, not a section designed at that thickness. That is the study's own
+  assumption; it is not extra licence taken here, but it must travel with the file.
+
+Getting this wrong is not cosmetic. e694 was chosen for its retention at the
+0.574c spar -- it keeps 0.935 of its thickness there where the as-built keeps
+0.814 -- and retention is entirely a matter of where the thickness sits
+(c_max_t 0.405 against 0.310). Exporting the as-built shape carrying e694's t/c
+NUMBERS would hand a colleague a wing whose spar depth does not match the study
+that justified it.
 
 Unlike the WingCalc path, the winglet is kept by default: it is dropped there
 only because the provider's spanwise interpolation needs a monotonic ws, which is
@@ -69,7 +84,20 @@ def write_dat(path, header, x, upper, lower):
             fh.write(f"{xi:.16f} {yi:.16f}\n")
 
 
-def export(mesh_m, toc, name, geom_id, out_dir, n_x=201, dir_hint=None):
+def database_profile(name, x_grid):
+    """Camber and thickness of a database section, normalized by chord, on x_grid.
+
+    Split rather than returned as upper/lower because the two are scaled
+    differently: the thickness carries the design's t/c, the camber does not.
+    """
+    import aerosandbox as asb
+    af = asb.Airfoil(name)
+    t = np.array([float(af.local_thickness(x_over_c=float(x))) for x in x_grid])
+    cam = np.array([float(af.local_camber(x_over_c=float(x))) for x in x_grid])
+    return cam, t
+
+
+def export(mesh_m, toc, name, geom_id, out_dir, n_x=201, dir_hint=None, airfoil=None):
     """Write <name>_af.csv plus one .dat per spanwise station. Returns the paths."""
     out_dir.mkdir(parents=True, exist_ok=True)
     comp = list(lifting_surfaces(read_degen_csv(config.BASELINES[w2.BASELINE])).values())[0][0]
@@ -90,14 +118,24 @@ def export(mesh_m, toc, name, geom_id, out_dir, n_x=201, dir_hint=None):
     x_grid = 0.5 * (1 - np.cos(np.linspace(0.0, np.pi, n_x)))
 
     hint = dir_hint or f"./{name}/"
+    # A named section is the same shape at every station, so its camber and
+    # thickness are built once; only the t/c scale changes down the span.
+    db = None if airfoil in (None, "", "as-built") else database_profile(airfoil, x_grid)
     blocks, dats = [], []
     for i in range(ny):
         f = 0.0 if span1 == span0 else (ws[i] - span0) / (span1 - span0)
-        up, lo = section_at(f, frac, x_n, up_n, lo_n, x_grid)
-        t_now = float(np.max(up - lo))
-        if t_now > 1e-9:                                     # rescale to this station's t/c
-            k = float(toc_node[i]) / t_now
-            up, lo = up * k, lo * k
+        if db is not None:
+            # thickness scaled to this station's t/c, camber untouched -- keeps
+            # c_max_t and the retention curve, which is why this section was picked
+            cam, t_n = db
+            k = float(toc_node[i]) / float(t_n.max())
+            up, lo = cam + 0.5 * t_n * k, cam - 0.5 * t_n * k
+        else:
+            up, lo = section_at(f, frac, x_n, up_n, lo_n, x_grid)
+            t_now = float(np.max(up - lo))
+            if t_now > 1e-9:                                 # rescale bodily
+                k = float(toc_node[i]) / t_now
+                up, lo = up * k, lo * k
         dat = f"{name}_{geom_id}_{i}.dat"
         write_dat(out_dir / dat, hint + dat, x_grid, up, lo)
         dats.append(out_dir / dat)
@@ -138,10 +176,14 @@ def load_design(arc):
         if p.exists():
             case = json.loads(p.read_text())
             r = replay(case, y_a, rule)
-            return r["mesh"], r["toc"], f"{p.name} ({airfoil}, {prof} t/c)"
+            # The section the design was BUILT on, taken from the design point
+            # rather than the environment, so a bundle cannot be exported on a
+            # section the aero was never run with.
+            sec = case.get("airfoil") or "as-built"
+            return r["mesh"], r["toc"], sec, f"{p.name} ({sec}, {prof} t/c)"
     case = json.loads((LOGS / fname).read_text())[key]
     r = replay(case, y_a, rule)
-    return r["mesh"], r["toc"], f"{fname}:{key} (as-built t/c)"
+    return r["mesh"], r["toc"], "as-built", f"{fname}:{key} (as-built t/c)"
 
 
 if __name__ == "__main__":
@@ -154,9 +196,10 @@ if __name__ == "__main__":
     GEOMS.mkdir(parents=True, exist_ok=True)
     for arc in arcs:
         name = f"Arc{arc}"
-        mesh, toc, prov = load_design(arc)
+        mesh, toc, sec, prov = load_design(arc)
         work = GEOMS / name
-        csv_path, dats = export(mesh, toc, name, GEOM_ID[arc], work, n_x=a.n_x)
+        csv_path, dats = export(mesh, toc, name, GEOM_ID[arc], work,
+                                n_x=a.n_x, airfoil=sec)
         zpath = GEOMS / f"{name}.zip"
         with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(csv_path, f"{name}/{csv_path.name}")

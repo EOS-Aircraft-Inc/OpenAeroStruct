@@ -26,8 +26,15 @@ DRAG IS NOT THE MERIT FUNCTION. The study ranks designs on electric range at
 fixed MTOW, m_batt/D, where wing weight trades against battery. Break-even is
 1.486 lb of wing weight per newton of drag, so each drag bar is annotated with
 the weight that class must save to be worth having, rather than leaving a drag
-ranking to be read as a verdict. Those weights need WingCalc; range itself is not
-plotted here, since none of these three is sized.
+ranking to be read as a verdict.
+
+All three ARE now sized, so the merit function itself is plotted: wing weight,
+electric range, and the range-vs-weight trade each architecture sits on. Arc B
+needed a fix to get there -- its straight forward spar means the stringer ladder
+sheds rungs from the BACK, so the deck's access cut-out pair (Stg 6 / Stg 8) was
+on the wrong side of the box and bays 16-20 had nowhere to put the cut-out; see
+coupling/deck.py:resolve_cutout. Plan L was never sized in this batch and is drawn
+as 'not sized' rather than given a borrowed weight.
 
 Writes out/figures/class_comparison.png.
 """
@@ -280,6 +287,17 @@ if __name__ == "__main__":
     r_fwd = replay(cB, w2.REGION_A_END_IN, "preserved")
     print("  replaying Arc A (constant chord) ...")
     r_cc = replay(cA, REGION_A_AS_BUILT_IN, "root_le_fixed")
+    # The sized weight belongs to the DESIGN POINT, not the replay: replay
+    # reproduces the aero, WingCalc produced the weight. Carrying it across is what
+    # lets the merit function be plotted instead of proxied by a break-even
+    # allowance. `converged` travels with it -- these loops stop at their pass
+    # limit, so the number is close but flagged, not certified.
+    for _r, _c in ((r_cc, cA), (r_fwd, cB), (r_free, cC)):
+        _r["w_wing_lb"] = _c.get("w_wing_lb")
+        _r["R_nmi"] = _c.get("R_nmi")
+        _r["w_converged"] = bool(_c.get("converged"))
+        _r["sizing_error"] = _c.get("sizing_error")
+
     TOC_NOTE = provC
     print("  evaluating Plan L as-built (the reference) ...")
     r_pl = baseline_case("plan_l")
@@ -293,8 +311,9 @@ if __name__ == "__main__":
     rets = [retention_fn(r.get("airfoil")) for r in res]
     span = [spanwise(r, schedule, rt) for r, rt in zip(res, rets)]
 
-    fig = plt.figure(figsize=(16.5, 16))
-    gs = fig.add_gridspec(4, 3, height_ratios=[1.0, 1.2, 1.0, 1.0], hspace=0.42, wspace=0.30)
+    fig = plt.figure(figsize=(16.5, 19.5))
+    gs = fig.add_gridspec(5, 3, height_ratios=[1.0, 1.2, 1.0, 1.0, 1.0],
+                          hspace=0.42, wspace=0.30, bottom=0.075)
     names = [c[0] for c in CLASSES]
     # Bar ticks get the short name only -- "Arc A constant chord" and its
     # neighbours overlap. The line panels carry the full descriptor in the legend.
@@ -475,6 +494,79 @@ if __name__ == "__main__":
     ax.set_title("Wingbox width vs requirement\n(0.12c to the scheduled aft spar)", fontsize=10.5)
     ax.legend(fontsize=7.5); ax.grid(alpha=0.25)
 
+    # ================= THE MERIT FUNCTION ITSELF =================
+    # Everything above is drag, area and geometry. These three are what the study
+    # actually ranks on, and they exist only because all three arcs are sized.
+    sized = [(nm, c, r) for (nm, c, tag), r in zip(CLASSES, res)
+             if r.get("w_wing_lb") is not None]
+
+    # --- wing weight, as sized by WingCalc at MTOW
+    ax = fig.add_subplot(gs[4, 0])
+    for i, ((nm, c, tag), r) in enumerate(zip(CLASSES, res)):
+        w = r.get("w_wing_lb")
+        if w is None:
+            ax.text(i, 0.02, "not sized\n(as-built loft)", ha="center", va="bottom",
+                    fontsize=8, color="0.45", transform=ax.get_xaxis_transform())
+            continue
+        ax.bar(i, w, color=c, edgecolor="k", lw=0.6)
+        # A trailing * is the honest mark: the weight loop hit its pass limit
+        # rather than the 25 lb tolerance.
+        ax.text(i, w + 30, f"{w:,.0f}" + ("" if r["w_converged"] else "*"),
+                ha="center", va="bottom", fontsize=9.5, fontweight="bold")
+    wl = [r["w_wing_lb"] for _n, _c, r in sized]
+    if wl:
+        ax.set_ylim(0.95 * min(wl), 1.03 * max(wl))
+    ax.set_xticks(xs); ax.set_xticklabels(names, fontsize=9)
+    ax.set_ylabel("W_wing, lb")
+    ax.set_title("Wing weight — WingCalc, sized at MTOW\n(* = weight loop hit its pass limit)",
+                 fontsize=10.5)
+    ax.grid(alpha=0.25, axis="y")
+
+    # --- electric range: the actual ranking
+    ax = fig.add_subplot(gs[4, 1])
+    rr = [(nm, c, r["R_nmi"]) for nm, c, r in sized if r.get("R_nmi") is not None]
+    for i, ((nm, c, tag), r) in enumerate(zip(CLASSES, res)):
+        R = r.get("R_nmi")
+        if R is None:
+            ax.text(i, 0.02, "not sized", ha="center", va="bottom", fontsize=8,
+                    color="0.45", transform=ax.get_xaxis_transform())
+            continue
+        ax.bar(i, R, color=c, edgecolor="k", lw=0.6)
+        ax.text(i, R + 0.25, f"{R:.1f}", ha="center", va="bottom",
+                fontsize=9.5, fontweight="bold")
+    if rr:
+        best = max(rr, key=lambda t: t[2])
+        ax.axhline(best[2], color=best[1], ls="--", lw=1.1, alpha=0.7)
+        ax.text(0.99, best[2], f" best: {best[0]} ", ha="right", va="bottom",
+                fontsize=8, color=best[1], fontweight="bold",
+                transform=ax.get_yaxis_transform())
+        vals = [t[2] for t in rr]
+        ax.set_ylim(0.97 * min(vals), 1.012 * max(vals))
+    ax.set_xticks(xs); ax.set_xticklabels(names, fontsize=9)
+    ax.set_ylabel("electric range, nmi")
+    ax.set_title("Electric range at fixed MTOW — THE MERIT FUNCTION\n(m_batt/D; wing weight trades against battery)",
+                 fontsize=10.5)
+    ax.grid(alpha=0.25, axis="y")
+
+    # --- the trade each architecture sits on. One curve per design at ITS OWN
+    # drag, so the vertical gap between curves is the drag difference and
+    # movement along a curve is the weight difference. Plan L has a curve but no
+    # point: it shows the weight Plan L would have to reach to match.
+    ax = fig.add_subplot(gs[4, 2])
+    wgrid = np.linspace(6400.0, 9200.0, 120)
+    for (nm, c, tag), r in zip(CLASSES, res):
+        ax.plot(wgrid, [mission.electric_range_nmi(w, r["drag_N"]) for w in wgrid],
+                color=c, lw=1.6, ls="--" if tag == "reference" else "-",
+                label=f"{nm} ({r['drag_N']:.0f} N)")
+        w = r.get("w_wing_lb")
+        if w is not None:
+            ax.plot([w], [mission.electric_range_nmi(w, r["drag_N"])], "o",
+                    color=c, ms=8, mec="k", mew=0.8, zorder=6)
+    ax.set_xlabel("wing weight, lb"); ax.set_ylabel("electric range, nmi")
+    ax.set_title("Range vs wing weight — each at its own drag\n(marker = where the design actually sits)",
+                 fontsize=10.5)
+    ax.legend(fontsize=7.2); ax.grid(alpha=0.25)
+
     fig.suptitle("Best drag available inside each planform constraint class — full OAS at MTOW 382 547 N, "
                  "span pinned at 118 ft, all trimmed to the same lift\n"
                  f"Arc A / B / C carry the {TOC_NOTE} profile; Plan L is the as-built loft",
@@ -482,7 +574,7 @@ if __name__ == "__main__":
     fig.text(0.5, 0.048, DEFINITIONS, ha="center", fontsize=10, fontweight="bold")
     fig.text(0.5, 0.020,
              "All percentages are against PLAN L AS-BUILT. Drag is NOT the merit function: the study ranks on electric range at fixed MTOW (m_batt/D), break-even "
-             f"{BREAK_EVEN_LB_PER_N:.3f} lb of wing per newton,\nso 'may weigh' is how much heavier each architecture can be and still match Plan L on range. "
+             f"{BREAK_EVEN_LB_PER_N:.3f} lb of wing per newton,\nso 'may weigh' is how much heavier each architecture can be and still match Plan L on range -- and the bottom row now plots that range directly. "
              "Wing-only drag throughout. Depth and width use EACH design's own section retention.\nDesign points: Arc A = wing 8, Arc B = wing 7, Arc C = wing 3.",
              ha="center", fontsize=8.5, style="italic")
 
@@ -498,11 +590,23 @@ if __name__ == "__main__":
         print(f"  {nm.replace(chr(10), ' '):26} depth {d_ail:5.2f} in @ aileron, {d_jun:5.2f} in @ junction | "
               f"box {w_in:6.2f} in @ inboard nacelle (need 65), {w_out:6.2f} in @ outboard (need 55)")
 
-    print("\n" + "=" * 84)
-    print(f"{'architecture':26} {'drag N':>10} {'vs Plan L':>9} {'S_ref ft2':>10} {'induced':>9} {'viscous':>9} {'may weigh lb':>13}")
+    print("\n" + "=" * 104)
+    print(f"{'architecture':26} {'drag N':>10} {'vs Plan L':>9} {'S_ref ft2':>10} "
+          f"{'W_wing lb':>11} {'R nmi':>8} {'vs Plan L':>9} {'may weigh lb':>13}")
     for (nm, _, tag), r in zip(CLASSES, res):
         d = r["drag_N"] - ref
+        w, R = r.get("w_wing_lb"), r.get("R_nmi")
+        wtxt = f"{w:>10,.0f}" + ("" if r.get("w_converged") else "*") if w else f"{'UNSIZED':>11}"
+        rtxt = f"{R:>8.1f}" if R else f"{'-':>8}"
         print(f"{nm + ' (' + tag + ')':26} {r['drag_N']:>10.1f} "
-              f"{100*(r['drag_N']/ref-1):>+8.2f}% {r['S_ref']*10.7639104:>10.1f} {r['induced_N']:>9.1f} "
-              f"{r['viscous_N']:>9.1f} {-BREAK_EVEN_LB_PER_N*d:>+13.1f}")
-    print("=" * 84)
+              f"{100*(r['drag_N']/ref-1):>+8.2f}% {r['S_ref']*10.7639104:>10.1f} "
+              f"{wtxt:>11} {rtxt} {'':>9} {-BREAK_EVEN_LB_PER_N*d:>+13.1f}")
+    print("=" * 104)
+    # Range against the best, which is what a reader wants from a ranking.
+    rk = sorted(((r.get("R_nmi"), nm) for (nm, _, _), r in zip(CLASSES, res)
+                 if r.get("R_nmi")), reverse=True)
+    if rk:
+        top = rk[0][0]
+        print("  ranking on electric range: " + ",  ".join(
+            f"{nm} {R:.1f} nmi ({100*(R/top-1):+.2f}%)" for R, nm in rk))
+        print("  * weight loop stopped at its pass limit, not the 25 lb tolerance.")

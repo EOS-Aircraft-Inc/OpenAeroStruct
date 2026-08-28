@@ -37,8 +37,19 @@ The cases:
                         +59.3 N on wing 3. Its root twist sits on the +5 deg
                         bound, so that cost is an upper bound.
 
+  Arc A / B / C         the three planform CONSTRAINT CLASSES, each re-optimized
+                        on the e694 section at the adopted t/c profile (root
+                        0.246 -> 0.146 tip) and sized through the coupled weight
+                        loop. Arc A holds constant chord, Arc B holds a straight
+                        forward spar, Arc C is free. A different kind of case from
+                        wings 2-6 -- those vary one constraint at a time on one
+                        planform family, these are three families on a chosen
+                        section -- so they carry distinct colours rather than the
+                        next in the sequence. Arc C wins on range.
+
 Produces `wing_comparison.png`: drag and its breakdown, wing weight, area,
-planforms, chord, twist, and the front/aft spar chord ratios along the span.
+planforms, chord, twist, the front/aft spar chord ratios, electric range and its
+trade against weight, and the t/c distribution along the span.
 """
 
 import json
@@ -85,6 +96,12 @@ COLORS = {
     "wing 5\n(+ inboard t/c)": "#55A868",
     "wing 6\n(t/c + monotonic)": "#0B7A75",
 }
+# The three architectures are the study's end point, and they are a different KIND
+# of case from wings 2-6: those vary one constraint at a time on one planform
+# family, these are three separate families each re-optimized on a chosen section
+# at the adopted t/c. Distinct hues rather than the next colours in the sequence,
+# so the eye does not read them as "wing 7, 8, 9".
+ARC_COLORS = {"A": "#F0A202", "B": "#5D3FD3", "C": "#111111"}
 
 
 def eval_baseline(name):
@@ -221,6 +238,46 @@ if __name__ == "__main__":
     else:
         print("  NOTE: wing6_design_point.json not present -- wing 6 omitted")
 
+    # ---- the three architectures, at the adopted section and t/c ----
+    # These carry their OWN sized weight from arc_optimal_toc.py -- a converged-ish
+    # bi-level fixed point -- so they are put in before the sizing block below and
+    # skipped by it rather than re-sized one-shot at its 8400 lb seed.
+    from compare_classes import replay as arc_replay, stations_and_schedule  # noqa: E402
+    from wing8_constchord_toc import REGION_A_AS_BUILT_IN  # noqa: E402
+
+    ARC_AIRFOIL = os.environ.get("ARC_AIRFOIL", "e694")
+    ARC_PROFILE = os.environ.get("ARC_TOC_PROFILE", "optimal")
+    _sfx = "" if ARC_AIRFOIL in ("", "as-built") else f"_{ARC_AIRFOIL}"
+    _arc_schedule, _, _ = stations_and_schedule()
+    ARC_SPEC = {                       # region A end, region A rule
+        "A": (REGION_A_AS_BUILT_IN, "root_le_fixed"),
+        "B": (w2.REGION_A_END_IN, "preserved"),
+        "C": (w2.REGION_A_END_IN, "root_le_fixed"),
+    }
+    for _arc in sorted(ARC_SPEC):
+        _y_a, _rule = ARC_SPEC[_arc]
+        _p = Path(LOGS) / f"arc_optimal_toc_{_arc}_{ARC_PROFILE}{_sfx}.json"
+        if not _p.exists():
+            print(f"  NOTE: {_p.name} absent -- Arc {_arc} left off the figure")
+            continue
+        _c = json.loads(_p.read_text())
+        print(f"  replaying Arc {_arc} ({ARC_AIRFOIL}, {ARC_PROFILE} t/c) ...", flush=True)
+        _r = arc_replay(_c, _y_a, _rule)
+        # replay reports CDi and CDv only; these designs are subsonic here and
+        # their logged wave drag is zero, but take it from the case rather than
+        # assuming it.
+        _r["wave_N"] = float(_c.get("wave_N", 0.0))
+        _r["schedule"] = _arc_schedule
+        _r["CL"] = _c.get("CL")
+        if _c.get("w_wing_lb"):
+            _r["w_wing_lb"] = float(_c["w_wing_lb"])
+        else:
+            print(f"    Arc {_arc} has no sized weight ({str(_c.get('sizing_error'))[:60]});"
+                  f" drawn as 'not sized'")
+        _key = f"Arc {_arc}\n({ARC_PROFILE} t/c, {ARC_AIRFOIL})"
+        cases[_key] = _r
+        COLORS[_key] = ARC_COLORS[_arc]
+
     # ---- wing weight for every case, from the structural tool ----
     # A drag-only chart cannot rank wing 5, whose whole merit is weight. So each
     # case's rebuilt geometry is exported and sized. Cached: sizing is ~180 s a
@@ -308,14 +365,14 @@ if __name__ == "__main__":
               f"{c['drag_N'] / base - 1:+7.2%}   CL {c['CL']:.4f}{wl}")
 
     # ---------------- figure ----------------
-    fig = plt.figure(figsize=(16, 14.5))
+    fig = plt.figure(figsize=(16, 18))
     fig.suptitle(
-        "Plan L (reference) vs ConstChord vs wings 2–6 — drag from full OAS at MTOW 382 547 N, span pinned at "
-        "118 ft, all trimmed to the same lift;\nwing weight from WingCalc sizing the same geometry. "
+        "Plan L (reference) vs ConstChord vs wings 2–6 vs Arc A/B/C — drag from full OAS at MTOW 382 547 N, span "
+        "pinned at 118 ft, all trimmed to the same lift;\nwing weight from WingCalc sizing the same geometry. "
         "All percentages are against PLAN L.",
         fontsize=13,
     )
-    gs = fig.add_gridspec(4, 3, hspace=0.40, wspace=0.28)
+    gs = fig.add_gridspec(5, 3, hspace=0.40, wspace=0.28)
     cols = [COLORS[n] for n in names]
     # Bar charts get the short name only; the full label overlaps its neighbours.
     short = [n.split("\n")[0] for n in names]
@@ -478,7 +535,30 @@ if __name__ == "__main__":
                  f"(break-even {BREAK_EVEN_LB_PER_N:.2f} lb per N of drag: a line crossing another is the weight that pays for its drag)",
                  fontsize=10.5)
     ax.legend(fontsize=8, ncol=2); ax.grid(alpha=0.3)
-    ax.grid(alpha=0.3); ax.legend(fontsize=7, loc="center left", framealpha=0.9)
+    ax.grid(alpha=0.3); ax.legend(fontsize=7, loc="lower left", framealpha=0.9)
+
+    # thickness ratio -- the axis wings 5/6 and the three arcs are actually moving,
+    # and the one the earlier wings hold at the as-built loft. Without it the arcs'
+    # 0.246 -> 0.146 taper is invisible on this sheet even though it is the change
+    # that produced them.
+    ax = fig.add_subplot(gs[4, :])
+    for n in names:
+        y, _, _ = planform(cases[n]["mesh"])
+        toc = np.asarray(cases[n]["toc"]).ravel()
+        yp = 0.5 * (y[:-1] + y[1:]) if len(toc) == len(y) - 1 else y
+        if len(yp) != len(toc):                    # never silently mis-align a curve
+            print(f"  NOTE: {n.replace(chr(10),' ')} t/c has {len(toc)} values for "
+                  f"{len(y)} nodes -- left off the t/c panel")
+            continue
+        ax.plot(yp, toc, color=COLORS[n], lw=1.9,
+                ls="--" if n.endswith("as-built") else "-", label=n.replace("\n", " "))
+    for ys_ in (176.0, 356.0):
+        ax.axvline(ys_, color="0.45", ls=":", lw=1.0)
+    ax.axvline(0.90 * 708.0, color="#8172B2", lw=1.4, ls="--")
+    ax.set_xlabel("y, in"); ax.set_ylabel("t/c")
+    ax.set_title("Thickness ratio t/c — dashed = as-built loft (held flat); the arcs carry the swept-optimum "
+                 "profile, wings 5/6 raise it inboard only", fontsize=11)
+    ax.grid(alpha=0.3); ax.legend(fontsize=8, ncol=3)
 
     fig.text(0.5, 0.012,
              "wing 2 shown is the ADMISSIBLE 7 in design (spar 0.400c). The often-quoted -2.52% wing 2 cannot meet its own "
