@@ -51,8 +51,20 @@ from wing8_constchord_toc import REGION_A_AS_BUILT_IN           # noqa: E402
 LOGS = os.path.join(os.path.dirname(os.path.dirname(_HERE)), "out", "logs")
 q = 0.5 * config.RHO * config.V_MS**2
 SEMI_IN, Y_AIL = 708.0, 0.90 * 708.0
-DEPTH_REQ = 6.0
+# The aileron actuator depth floor. Raised 6 -> 7 in (user, 2026-08-28). With e694
+# and a thick root the arcs deliver 7.65-8.83 in at a 0.574c spar, so 7 in still
+# does not bind there -- but Arc A's straight aft spar sits at 0.750c, where the
+# section keeps only 0.640 of its thickness, so on Arc A it binds hard.
+DEPTH_REQ = 7.0
 SCHEDULE = ((356.0, 0.750), (674.9, 0.550))
+# Arc A carries its own: a CONSTANT 0.750c rear spar, so the aft spar is a straight
+# line root to junction. It has to be its own schedule, because x_aft = x_le +
+# rear(y)*chord(y) kinks wherever the ratio moves, and the shared schedule moves it
+# from exactly y=356 -- the outboard nacelle, the point past which Arc A is meant
+# to hold its aft spar straight. Arc A's forward spar is left to kink there instead
+# (it sits at a fixed 0.12c, so it follows the chord breakpoint), which is the
+# trade this architecture is making: one straight spar, and it is the aft one.
+SCHEDULE_A = ((356.0, 0.750), (674.9, 0.750))
 TOL_IN, MAX_PASS = 0.005, 5
 W_SEED_LB, W_TOL_LB = 8000.0, 25.0
 # The weight loop is a damped fixed point (w += 0.5 * residual) and it contracts by
@@ -71,11 +83,51 @@ PROFILES = {                    # (root t/c, tip/root) -> the 5 spline control p
     "optimal": (0.250, 0.58),   # the sweep's peak, 344.0 nmi
     "capped":  (0.220, 0.75),   # inside conventional thickness, 343.0 nmi
 }
-ARCHS = {                       # region A end, region A rule, pinned straight line
-    "A": (REGION_A_AS_BUILT_IN, "root_le_fixed", None),
-    "B": (w2.REGION_A_END_IN, "preserved", w2.FRONT_PCT),
-    "C": (w2.REGION_A_END_IN, "root_le_fixed", None),
+ARCHS = {          # region A end, region A rule, pinned straight line, rear schedule
+    "A": (REGION_A_AS_BUILT_IN, "root_le_fixed", None, SCHEDULE_A),
+    "B": (w2.REGION_A_END_IN, "preserved", w2.FRONT_PCT, SCHEDULE),
+    "C": (w2.REGION_A_END_IN, "root_le_fixed", None, SCHEDULE),
 }
+
+# Arcs whose AFT SPAR must be straight, which is a statement about geometry, not a
+# design variable to be pinned.
+#
+# The parameterization already builds x_LE(y) = x_spar - p * c(y), so the line at
+# the chord fraction p = `wingbox_pct` is straight at constant x by construction --
+# measured on the exported Arc A geometry it holds to 0.16 in over 675 in of span.
+# The rear spar used for the box WIDTH and DEPTH constraints is a separate,
+# SCHEDULED fraction, and it sits at
+#
+#     x_aft(y) = x_spar + (rear(y) - p) * c(y)
+#
+# which is constant in y -- straight -- if and only if rear(y) == p. So a straight
+# aft spar is not obtained by pinning p to a chosen number; it is obtained by making
+# the SCHEDULE follow p wherever the optimizer puts it.
+#
+# Pinning was tried and is actively harmful: with bounds collapsed to (0.750, 0.750)
+# SLSQP carries a zero-range design variable sitting on its own bound and fails with
+# "positive directional derivative for linesearch" -- measured, with and without the
+# planform rebuild that the pin branch also triggers. Leaving p free costs nothing
+# and removes the degeneracy: p simply becomes the spar station, and the depth
+# requirement reads the retention there.
+# value the spar fraction is FIXED at, and removed from the design variables.
+# rear(y) == p == this, both constant, so x_aft = x_spar + (rear - p) * c(y) is
+# constant in y: the aft spar is straight. 0.750 is chosen because the box width it
+# gives on Arc A's frozen 103.38 in region-A chord is (0.750 - 0.12) * 103.38 =
+# 65.13 in, which meets the 65 in nacelle requirement almost exactly -- any less and
+# the inboard box fails, any more and it is wasted depth.
+#
+# NOT a design variable and NOT pinned. Collapsing its bounds to (0.750, 0.750) was
+# tried and fails: SLSQP carries a zero-range variable on its own bound and exits
+# with "positive directional derivative for linesearch". Making the schedule chase
+# the free variable instead was also tried and DIVERGES, because param.py:523 bakes
+# _box_frac in at setup, so nothing inside the optimization ties the variable to the
+# schedule it was built from (measured: p ran 0.681 -> 0.616 -> 0.544 -> 0.466 with
+# drag climbing 11183 -> 11509 -> 12158 N).
+#
+# taper_B stays free: growing outboard chord to reach the aileron depth is a TAPER
+# change, which is the mechanism that should pay for it.
+STRAIGHT_AFT_PCT = {"A": 0.750}
 
 
 def section(name=None):
@@ -101,17 +153,99 @@ def section(name=None):
     return ret, c_max_t
 
 
-SPAR_AIL = float(rear_spar_fraction(Y_AIL, SCHEDULE))
+def blended_section(name_in, name_out, f0, f1, semi_in=SEMI_IN):
+    """Two sections lofted along the span: `name_in` inboard, `name_out` outboard.
+
+    The two requirements on the section live at opposite ends of the wing, which is
+    why one section cannot serve both. Inboard carries nearly all the wetted area
+    and has chord to spare, so it wants L/D. The aileron station wants THICKNESS AT
+    THE SPAR -- depth = retention(spar) * t/c * chord -- and at a 0.750c spar e694
+    keeps only 0.640 of its thickness, which is what forced a 29% chord growth.
+    An aft-thick section keeps 0.81 there, and outboard of 80% semi-span there is
+    only 11.8% of the planform area for its poorer L/D to be paid on.
+
+    Linear loft on the THICKNESS distribution between f0 and f1 (fractions of
+    semi-span), which is what a real lofted wing does between two defining
+    sections. Both returned quantities therefore vary along the span:
+
+      ret_at(y, spar)  thickness retention -- fixes the depth, and so the chord
+      cmt_at(y)        c_max_t -- the only other thing OAS sees of a section
+
+    OAS takes c_max_t as an array over panels with no change (verified: a constant
+    array reproduces the scalar exactly, and the analytic partials still match
+    complex-step to 1e-19), so a spanwise section costs nothing but this function.
+    """
+    xs = np.linspace(0.05, 0.95, 300)
+
+    def prof(name):
+        if name in (None, "", "as-built"):
+            af = asbuilt()
+        else:
+            import aerosandbox as asb
+            af = asb.Airfoil(name)
+        return np.array([float(af.local_thickness(x_over_c=float(x))) for x in xs])
+
+    t_in, t_out = prof(name_in), prof(name_out)
+
+    def w_of(y_in):
+        return float(np.clip((abs(y_in) / semi_in - f0) / (f1 - f0), 0.0, 1.0))
+
+    def t_at(y_in):
+        w = w_of(y_in)
+        return (1.0 - w) * t_in + w * t_out
+
+    def ret_at(y_in, spar):
+        t = t_at(y_in)
+        return float(np.interp(spar, xs, t / t.max()))
+
+    def cmt_at(y_in):
+        t = t_at(y_in)
+        return float(xs[int(np.argmax(t))])
+
+    return ret_at, cmt_at, w_of
+
+
+# Arc A only. B and C keep their 0.574c spar, where e694 is already excellent
+# (retention 0.935) and there is nothing to buy.
+# Started as LATE as the requirement allows. The blend has to be COMPLETE by the
+# aileron: full goe16k retains 0.8106 at a 0.750c spar and 0.8237 is what the 7 in
+# floor needs at the delivered chord, so a partially blended section cannot reach
+# it -- there is no credit for starting earlier, only cost. The start is therefore
+# put on the last RIB inboard of the aileron that still leaves a buildable
+# transition: y = 601.0 in (84.9% semi), one rib bay to 639.5, a 36.2 in loft
+# (5.1% of semi-span) with only 8.3% of the planform area outboard of it.
+# 562.5 in (79.4%, a 74.7 in loft) is the fallback if the aero side wants a gentler
+# spanwise pressure transition; it costs L/D over 12.2% of the area instead of 8.3%.
+_BLEND_START_IN = 601.0
+SECTION_BLEND = {
+    "A": ("e694", "goe16k", _BLEND_START_IN / SEMI_IN, 0.90),
+}
+
 RET, C_MAX_T = section()          # replaced at run time by --airfoil
+RET_AT = CMT_AT = None            # set per arc when that arc blends sections
 
 
-def optimize(y_a_in, rule, pin_p, cp_toc, c_req):
+def spar_at_aileron(schedule):
+    """Aft-spar chord fraction at the aileron -- per arc, since it sets the depth.
+
+    Not a constant: Arc A's straight aft spar puts it at 0.750c where the shared
+    schedule puts it at 0.574c, and e694 keeps only 0.640 of its thickness at
+    0.750c against 0.935 at 0.574c. The depth requirement is
+    ``depth = retention(spar) * t/c * chord``, so the SAME 6 in needs about 46%
+    more chord on Arc A than on B or C. That is the real price of a straight aft
+    spar, and it is paid in area, not in the spar.
+    """
+    return float(rear_spar_fraction(Y_AIL, schedule))
+
+
+def optimize(y_a_in, rule, pin_p, cp_toc, c_req, schedule, fix_pct=None):
+    spar_ail = spar_at_aileron(schedule)
     stations = ((100.0, 65.0), (176.0, 65.0), (356.0, 55.0),
-                (Y_AIL, (SPAR_AIL - w2.FRONT_PCT) * c_req),
+                (Y_AIL, (spar_ail - w2.FRONT_PCT) * c_req),
                 (674.9, w2.JUNCTION_BOX_IN))
-    w2.REAR_SCHEDULE, w2.WIDTH_STATIONS = SCHEDULE, stations
+    w2.REAR_SCHEDULE, w2.WIDTH_STATIONS = schedule, stations
     config.WINGBOX_FRONT_PCT = w2.FRONT_PCT
-    config.WINGBOX_REAR_SCHEDULE = SCHEDULE
+    config.WINGBOX_REAR_SCHEDULE = schedule
     config.WINGBOX_WIDTH_STATIONS = stations
     pct0 = config.WINGBOX_CHORD_PCT_BOUNDS
     config.WINGBOX_CHORD_PCT_BOUNDS = pct0 if pin_p is None else (pin_p, pin_p)
@@ -127,7 +261,16 @@ def optimize(y_a_in, rule, pin_p, cp_toc, c_req):
 
         def _surface(mesh_, stick_, regions_, **kw):
             sd = orig_build_surface(mesh_, stick_, regions_, **kw)
-            sd["c_max_t"] = C_MAX_T
+            if CMT_AT is None:
+                sd["c_max_t"] = C_MAX_T
+            else:
+                # One c_max_t per PANEL. Span is pinned and the DVs are taper,
+                # twist, t/c and alpha -- none of which move a spanwise station --
+                # so the panel y positions are fixed for the life of the problem
+                # and this array can be built once here.
+                ym = np.abs(np.asarray(mesh_)[0, :, 1]) / config.SCALE   # inches
+                yp = 0.5 * (ym[:-1] + ym[1:])
+                sd["c_max_t"] = np.array([CMT_AT(v) for v in yp])
             return sd
 
         ro.build_surface = _surface
@@ -135,16 +278,21 @@ def optimize(y_a_in, rule, pin_p, cp_toc, c_req):
             prob, _ = ro.build_problem(w2.BASELINE, mesh, stick, regions, planform0)
         finally:
             ro.build_surface = orig_build_surface
+        if fix_pct is not None:
+            prob.set_val("wing.wingbox_pct", fix_pct)
         n_cp = int(np.asarray(prob.get_val("wing.t_over_c_cp")).size)
         cp = np.linspace(cp_toc[0], cp_toc[0] * cp_toc[1], n_cp)
         prob.set_val("wing.t_over_c_cp", cp)
         prob.run_model()
         s0 = float(prob.get_val(f"{POINT}.wing.S_ref")[0])
         alpha0 = trim_alpha(prob, w2.W / (q * s0))
-        ro.add_optimization(prob, "plan_l", mesh, planform0, s0, mode="fixed_lift", weight=w2.W)
+        ro.add_optimization(prob, "plan_l", mesh, planform0, s0, mode="fixed_lift",
+                            weight=w2.W, pct_dv=(fix_pct is None))
         prob.set_val("wing.t_over_c_cp", cp)          # setup() reset it
         if pin_p is not None:
             prob.set_val("wing.wingbox_pct", pin_p)
+        if fix_pct is not None:
+            prob.set_val("wing.wingbox_pct", fix_pct)   # setup() reset it
         prob.set_val("alpha", alpha0, units="deg")
         prob.run_model()
         prob.run_driver()
@@ -158,7 +306,14 @@ def optimize(y_a_in, rule, pin_p, cp_toc, c_req):
     toc = np.asarray(prob.get_val("wing.t_over_c")).ravel()
     r["toc_delivered_ail"] = float(np.interp(Y_AIL, yp, toc))
     r["chord_at_aileron_in"] = float(np.asarray(prob.get_val("station_chord", units="m"))[3] / config.SCALE)
-    r["depth_delivered_in"] = RET(SPAR_AIL) * r["toc_delivered_ail"] * r["chord_at_aileron_in"]
+    ret_ail = RET(spar_ail) if RET_AT is None else RET_AT(Y_AIL, spar_ail)
+    r["depth_delivered_in"] = ret_ail * r["toc_delivered_ail"] * r["chord_at_aileron_in"]
+    r["spar_at_aileron"] = spar_ail
+    r["retention_at_spar"] = ret_ail
+    # Downstream draws depth, box width and the spar ratios from this, so it has
+    # to travel with the design: Arc A's schedule is not B's and not C's.
+    r["rear_schedule"] = [[float(a_), float(b_)] for a_, b_ in schedule]
+    r["section_blend"] = None      # filled in by solve() when the arc blends
     r["toc_root"], r["toc_tip"] = float(toc[0]), float(toc[-1])
     r["t_over_c_cp"] = cp.tolist()
     r["alpha"] = float(prob.get_val("alpha", units="deg")[0])
@@ -171,11 +326,40 @@ def optimize(y_a_in, rule, pin_p, cp_toc, c_req):
 
 def solve(arc, profile):
     """Converge the depth requirement, then converge the weight."""
-    y_a, rule, pin_p = ARCHS[arc]
+    global RET_AT, CMT_AT
+    y_a, rule, pin_p, schedule = ARCHS[arc]
+    spar_ail = spar_at_aileron(schedule)
     cp_toc = PROFILES[profile]
     label = f"arc {arc} / {profile}"
 
-    # --- depth: c_req from the DELIVERED t/c, iterated
+    blend = SECTION_BLEND.get(arc)
+    if blend is None:
+        RET_AT = CMT_AT = None
+        ret_ail = RET(spar_ail)
+        sec_note = "single section"
+    else:
+        n_in, n_out, f0, f1 = blend
+        RET_AT, CMT_AT, _w = blended_section(n_in, n_out, f0, f1)
+        ret_ail = RET_AT(Y_AIL, spar_ail)
+        sec_note = (f"{n_in} inboard -> {n_out} outboard, transition "
+                    f"{f0:.0%}-{f1:.0%} semi ({f0*SEMI_IN:.0f}-{f1*SEMI_IN:.0f} in)")
+    fix_pct = STRAIGHT_AFT_PCT.get(arc)
+    straight_aft = fix_pct is not None
+    if straight_aft:
+        schedule = ((356.0, fix_pct), (674.9, fix_pct))
+        spar_ail = fix_pct
+        print(f"  {label}: STRAIGHT aft spar -- rear spar and wingbox_pct both FIXED "
+              f"at {fix_pct:.3f}c, and wingbox_pct is NOT a design variable", flush=True)
+    else:
+        print(f"  {label}: rear spar {schedule[0][1]:.3f}c -> {schedule[-1][1]:.3f}c, "
+              f"aileron spar {spar_ail:.4f}c", flush=True)
+    print(f"  {label}: {sec_note}", flush=True)
+
+    def _ret(spar):
+        return RET(spar) if RET_AT is None else RET_AT(Y_AIL, spar)
+
+    # --- depth: c_req from the DELIVERED t/c, and for a straight aft spar also
+    #     from the DELIVERED p, since the spar station is then a design outcome.
     toc_use = None
     for p in range(1, MAX_PASS + 1):
         if toc_use is None:                     # seed from the baseline loft
@@ -183,14 +367,18 @@ def solve(arc, profile):
             _, stick0, _, _ = w2.load_relofted(w2.BASELINE, w2.REGION_A_END_IN)
             ys = np.abs(np.asarray(stick0.le[:, 1], dtype=float))
             toc_use = float(np.interp(Y_AIL, ys, stick0.toc))
-        c_req = DEPTH_REQ / (RET(SPAR_AIL) * toc_use)
-        r = optimize(y_a, rule, pin_p, cp_toc, c_req)
+        ret_ail = _ret(spar_ail)
+        c_req = DEPTH_REQ / (ret_ail * toc_use)
+        r = optimize(y_a, rule, pin_p, cp_toc, c_req, schedule, fix_pct=fix_pct)
         err = r["depth_delivered_in"] - DEPTH_REQ
+        extra = (f", spar {spar_ail:.3f}c fixed (ret {ret_ail:.4f})"
+                 if straight_aft else "")
         print(f"  {label} depth pass {p}: c_req {c_req:6.2f} -> depth "
-              f"{r['depth_delivered_in']:5.2f} in ({err:+.3f}), drag {r['drag_N']:9.1f} N", flush=True)
+              f"{r['depth_delivered_in']:5.2f} in ({err:+.3f}), drag {r['drag_N']:9.1f} N"
+              f"{extra}", flush=True)
         # The requirement is a FLOOR. Over-delivering is free -- it happens when
         # the aileron width constraint stops binding and the chord is set
-        # elsewhere -- so anything at or above 6 in is done. Only a shortfall
+        # elsewhere -- so anything at or above the floor is done. Only a shortfall
         # needs another pass, and only a shortfall can be fixed by more chord.
         if err >= -TOL_IN:
             break
@@ -232,6 +420,9 @@ def solve(arc, profile):
     r["weight_history"] = hist
     r["converged"] = bool(hist) and abs(hist[-1]["residual_lb"]) < W_TOL_LB
     r["arc"], r["profile"] = arc, profile
+    if blend is not None:
+        r["section_blend"] = {"inboard": blend[0], "outboard": blend[1],
+                              "f_start": blend[2], "f_end": blend[3]}
     r["root_toc_req"], r["ratio_req"] = cp_toc
     return r
 
@@ -245,12 +436,11 @@ if __name__ == "__main__":
     a = ap.parse_args()
 
     RET, C_MAX_T = section(a.airfoil)
-    print(f"section {a.airfoil}: c_max_t {C_MAX_T:.4f}, retention at {SPAR_AIL:.4f}c "
-          f"= {RET(SPAR_AIL):.4f}", flush=True)
+    print(f"section {a.airfoil}: c_max_t {C_MAX_T:.4f}", flush=True)
     res = solve(a.arc, a.profile)
     res["airfoil"] = a.airfoil
     res["c_max_t"] = C_MAX_T
-    res["retention_at_spar"] = RET(SPAR_AIL)
+    # retention_at_spar and spar_at_aileron come from solve(), per arc
     suffix = "" if a.airfoil == "as-built" else f"_{a.airfoil}"
     out = os.path.join(LOGS, f"arc_optimal_toc_{a.arc}_{a.profile}{suffix}.json")
     with open(out, "w") as f:

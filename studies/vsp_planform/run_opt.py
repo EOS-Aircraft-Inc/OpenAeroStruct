@@ -160,16 +160,27 @@ def build_problem(name, mesh, stick, regions, planform0, extra=None):
     return prob, surface
 
 
-def add_optimization(prob, name, mesh, planform0, s_ref0, mode="fixed_cl", weight=None):
-    """Attach the driver, design variables, constraints and objective."""
+def add_optimization(prob, name, mesh, planform0, s_ref0, mode="fixed_cl", weight=None,
+                     pct_dv=True):
+    """Attach the driver, design variables, constraints and objective.
+
+    ``pct_dv=False`` leaves ``wing.wingbox_pct`` OUT of the design variables, for a
+    design that fixes the spar fraction rather than optimizing it. Do not emulate
+    this by collapsing its bounds to a single value: SLSQP then carries a zero-range
+    variable sitting on its own bound and fails with "positive directional derivative
+    for linesearch". Measured on arc A -- the control converges, bounds pinned at
+    0.750 fails, and the same run with the variable simply absent converges. A fixed
+    quantity should not be a design variable at all.
+    """
     model = prob.model
 
     n_cp = config.N_TWIST_CP
     tw_lower, tw_upper = twist_cp_bounds(mesh, n_cp)
 
-    model.add_design_var(
-        "wing.wingbox_pct", lower=config.WINGBOX_CHORD_PCT_BOUNDS[0], upper=config.WINGBOX_CHORD_PCT_BOUNDS[1]
-    )
+    if pct_dv:
+        model.add_design_var(
+            "wing.wingbox_pct", lower=config.WINGBOX_CHORD_PCT_BOUNDS[0], upper=config.WINGBOX_CHORD_PCT_BOUNDS[1]
+        )
     model.add_design_var("wing.taper_B", lower=config.TAPER_B_BOUNDS[0], upper=config.TAPER_B_BOUNDS[1])
     model.add_design_var("wing.twist_cp", lower=tw_lower, upper=tw_upper, units="deg")
     model.add_design_var("alpha", lower=-5.0, upper=12.0, units="deg")

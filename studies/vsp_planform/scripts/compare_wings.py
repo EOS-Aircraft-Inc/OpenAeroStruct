@@ -86,6 +86,9 @@ q = 0.5 * config.RHO * config.V_MS**2
 # these charts is quoted against it. ConstChord is shown as the other as-built
 # geometry, and is the parent that wings 2 and 3 are derived from.
 REFERENCE = "Plan L\nas-built"
+# The wingbox ends at the winglet junction, so that -- not the aileron station --
+# is the reference line the spanwise panels mark.
+Y_JUNCTION_IN = 674.9
 
 COLORS = {
     "Plan L\nas-built": "#937860",
@@ -267,7 +270,12 @@ if __name__ == "__main__":
         # their logged wave drag is zero, but take it from the case rather than
         # assuming it.
         _r["wave_N"] = float(_c.get("wave_N", 0.0))
-        _r["schedule"] = _arc_schedule
+        # Each arc's OWN rear-spar schedule. Arc A holds a constant 0.750c aft
+        # spar so that spar is straight; B and C carry the shared 0.750 -> 0.550
+        # kink. Drawing Arc A on the shared one would show a spar it does not have.
+        _sc = _c.get("rear_schedule")
+        _r["schedule"] = (tuple((float(u), float(v)) for u, v in _sc) if _sc
+                          else _arc_schedule)
         _r["CL"] = _c.get("CL")
         if _c.get("w_wing_lb"):
             _r["w_wing_lb"] = float(_c["w_wing_lb"])
@@ -429,8 +437,8 @@ if __name__ == "__main__":
         y, le, te = planform(cases[n]["mesh"])
         ax.plot(y, le, color=COLORS[n], lw=1.7, label=n.replace("\n", " "))
         ax.plot(y, te, color=COLORS[n], lw=1.7)
-    ax.axvline(0.90 * 708.0, color="#8172B2", lw=1.6, ls="--")
-    ax.text(0.90 * 708.0 - 8, ax.get_ylim()[1], " aileron (wing 3)", color="#8172B2",
+    ax.axvline(Y_JUNCTION_IN, color="#0B7A75", lw=1.6, ls="--")
+    ax.text(Y_JUNCTION_IN - 8, ax.get_ylim()[1], " winglet junction", color="#0B7A75",
             fontsize=8, rotation=90, va="top", ha="right")
     ax.invert_yaxis(); ax.set_aspect("equal")
     ax.set_xlabel("y, in"); ax.set_ylabel("x, in")
@@ -442,7 +450,7 @@ if __name__ == "__main__":
     for n in names:
         y, le, te = planform(cases[n]["mesh"])
         ax.plot(y, te - le, color=COLORS[n], lw=1.8, label=n.replace("\n", " "))
-    ax.axvline(0.90 * 708.0, color="#8172B2", lw=1.5, ls="--")
+    ax.axvline(Y_JUNCTION_IN, color="#0B7A75", lw=1.5, ls="--")
     ax.set_xlabel("y, in"); ax.set_ylabel("chord, in")
     ax.set_title("Chord distribution", fontsize=11)
     ax.grid(alpha=0.3); ax.legend(fontsize=7)
@@ -457,8 +465,8 @@ if __name__ == "__main__":
         dashed = n.startswith(("wing 5", "wing 6"))
         ax.plot(y, cases[n]["twist"], color=COLORS[n], lw=1.9,
                 ls=(0, (5, 2.5)) if dashed else "-", label=n.replace("\n", " "))
-    ax.axvline(0.90 * 708.0, color="#8172B2", lw=1.5, ls="--")
-    ax.text(0.90 * 708.0, ax.get_ylim()[1], " aileron (wing 3)", color="#8172B2", fontsize=8, va="top")
+    ax.axvline(Y_JUNCTION_IN, color="#0B7A75", lw=1.5, ls="--")
+    ax.text(Y_JUNCTION_IN, ax.get_ylim()[1], " winglet junction", color="#0B7A75", fontsize=8, va="top", ha="right")
     ax.set_xlabel("y, in"); ax.set_ylabel("twist, deg")
     ax.set_title("Twist — wings 4 and 6 constrained monotonic ROOT TO JUNCTION\n(both sit on the +5 deg root bound)", fontsize=11)
     ax.grid(alpha=0.3); ax.legend(fontsize=8, ncol=2)
@@ -488,7 +496,7 @@ if __name__ == "__main__":
     ax.annotate("schedule breakpoints\n356 in / 674.9 in", xy=(674.9, 0.19),
                 xytext=(-10, 0), textcoords="offset points", ha="right",
                 fontsize=7.5, color="0.45")
-    ax.axvline(0.90 * 708.0, color="#8172B2", lw=1.5, ls="--")
+    ax.axvline(Y_JUNCTION_IN, color="#0B7A75", lw=1.5, ls="--")
     ax.set_ylim(0.0, 0.85)
     ax.set_xlabel("y, in"); ax.set_ylabel("spar station, x/c")
     ax.set_title("Front and aft spar chord ratios\n(as-built baselines have no scheduled box)", fontsize=11)
@@ -554,7 +562,7 @@ if __name__ == "__main__":
                 ls="--" if n.endswith("as-built") else "-", label=n.replace("\n", " "))
     for ys_ in (176.0, 356.0):
         ax.axvline(ys_, color="0.45", ls=":", lw=1.0)
-    ax.axvline(0.90 * 708.0, color="#8172B2", lw=1.4, ls="--")
+    ax.axvline(Y_JUNCTION_IN, color="#0B7A75", lw=1.4, ls="--")
     ax.set_xlabel("y, in"); ax.set_ylabel("t/c")
     ax.set_title("Thickness ratio t/c — dashed = as-built loft (held flat); the arcs carry the swept-optimum "
                  "profile, wings 5/6 raise it inboard only", fontsize=11)

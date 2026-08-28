@@ -74,6 +74,11 @@ BREAK_EVEN_LB_PER_N = 15551.7 / 10463.9341
 # station. 176 in is the INBOARD nacelle and 356 in the OUTBOARD one; 674.9 in is
 # the winglet junction, whose 20 in is what derives the junction chord.
 NACELLES = {176.0: "inboard nacelle", 356.0: "outboard nacelle"}
+# The wingbox ends at the winglet junction. Outboard of it there is wing but no
+# box, so anything drawn or reported as structure has to stop here.
+Y_JUNCTION_IN = 674.9
+# Aileron actuator depth floor, matching arc_optimal_toc.DEPTH_REQ.
+DEPTH_REQ_IN = 7.0
 
 
 def retention_fn(airfoil=None):
@@ -307,9 +312,21 @@ if __name__ == "__main__":
     ref = r_pl["drag_N"]                        # Plan L as-built: every % is against it
 
     schedule, stations, _ = stations_and_schedule()
+
+    def sched_of(r):
+        """This case's OWN rear-spar schedule.
+
+        Arc A holds a constant 0.750c aft spar so that its aft spar is straight;
+        B and C carry the shared 0.750 -> 0.550 kink. Drawing all three on one
+        schedule would put Arc A's depth, box width and spar ratio on a spar it
+        does not have.
+        """
+        sc = r.get("rear_schedule")
+        return tuple((float(a_), float(b_)) for a_, b_ in sc) if sc else schedule
+
     # one retention curve per case, from that design's own section
     rets = [retention_fn(r.get("airfoil")) for r in res]
-    span = [spanwise(r, schedule, rt) for r, rt in zip(res, rets)]
+    span = [spanwise(r, sched_of(r), rt) for r, rt in zip(res, rets)]
 
     fig = plt.figure(figsize=(16.5, 23))
     gs = fig.add_gridspec(6, 3, height_ratios=[1.0, 1.2, 1.0, 1.0, 1.0, 1.15],
@@ -375,8 +392,9 @@ if __name__ == "__main__":
         ax.annotate(lab, xy=(ys_, 0.985), xycoords=("data", "axes fraction"),
                     xytext=(3, 0), textcoords="offset points",
                     color="0.35", fontsize=7.5, va="top", ha="left")
-    ax.axvline(0.90 * 708.0, color="#8172B2", ls="--", lw=1.1)
-    ax.text(0.90 * 708.0, ax.get_ylim()[0], " aileron", color="#8172B2", fontsize=8, va="bottom")
+    ax.axvline(Y_JUNCTION_IN, color="#0B7A75", ls="--", lw=1.1)
+    ax.text(Y_JUNCTION_IN, ax.get_ylim()[0], " winglet junction", color="#0B7A75",
+            fontsize=8, va="bottom", ha="right")
     ax.invert_yaxis(); ax.set_xlabel("y, in"); ax.set_ylabel("x, in")
     ax.set_title("Planforms — leading and trailing edges")
     ax.legend(fontsize=8.5, loc="center left"); ax.grid(alpha=0.25)
@@ -424,7 +442,7 @@ if __name__ == "__main__":
     # front spar is the study's 0.12c applied for comparability, not a measurement.
     ax = fig.add_subplot(gs[2, 2])
     yy = REPORT_STATIONS_IN
-    sched = np.array([float(rear_spar_fraction(v, schedule)) for v in yy])
+    sched = np.array([float(rear_spar_fraction(v, schedule)) for v in yy])  # shared (B/C)
     # A, B and C are built to the SAME box -- front 0.12c, aft 0.750c held to
     # 356 in then kinking to 0.550c at the junction -- so their spar lines
     # coincide exactly. Staggered dashes draw all four rather than hiding three
@@ -450,7 +468,7 @@ if __name__ == "__main__":
             transform=ax.transAxes, fontsize=7.0, color="0.3")
     for ys_ in NACELLES:
         ax.axvline(ys_, color="0.45", ls=":", lw=1.0)
-    ax.axvline(0.90 * 708.0, color="#8172B2", ls="--", lw=1.1)
+    ax.axvline(Y_JUNCTION_IN, color="#0B7A75", ls="--", lw=1.1)
     ax.annotate("breakpoints\n356 / 674.9 in", xy=(362, 0.28), fontsize=7.0, color="0.35")
     ax.set_ylim(0.0, 0.88); ax.set_xlim(0, 760)
     ax.set_xlabel("y, in"); ax.set_ylabel("spar station, x/c")
@@ -463,9 +481,15 @@ if __name__ == "__main__":
     ax = fig.add_subplot(gs[3, 0])
     for (nm, c, tag), (y, _, depth, _) in zip(CLASSES, span):
         ax.plot(y, depth, color=c, lw=1.6, ls="--" if tag == "reference" else "-")
-    ax.axhline(6.0, color="#C44E52", ls="--", lw=1.2)
-    ax.text(5, 6.0, " 6 in required at the aileron", color="#C44E52", fontsize=7.5, va="bottom")
+    ax.axhline(DEPTH_REQ_IN, color="#C44E52", ls="--", lw=1.2)
+    ax.text(5, DEPTH_REQ_IN, f" {DEPTH_REQ_IN:.0f} in required at the aileron",
+            color="#C44E52", fontsize=7.5, va="bottom")
+    ax.set_ylim(bottom=min(DEPTH_REQ_IN - 0.6, ax.get_ylim()[0]))
+    # The aileron line stays on THIS panel only: 637.2 in is the aileron's
+    # outboard end, which is where the depth floor binds and where the markers
+    # below are plotted. Every other panel marks the winglet junction instead.
     ax.axvline(0.90 * 708.0, color="#8172B2", ls="--", lw=1.1)
+    ax.axvline(Y_JUNCTION_IN, color="#0B7A75", ls="--", lw=1.1)
     for ys_ in NACELLES:
         ax.axvline(ys_, color="0.45", ls=":", lw=1.0)
     ax.set_xlabel("y, in"); ax.set_ylabel("aft-spar depth, in")
@@ -583,32 +607,52 @@ if __name__ == "__main__":
             continue
         ax = fig.add_subplot(gs[5, col])
         m = r["mesh"] / config.SCALE
-        y = np.abs(m[0, :, 1])
-        x_le, x_te = m[0, :, 0], m[-1, :, 0]
+        y_full = np.abs(m[0, :, 1])
+        # The box ENDS at the winglet junction -- there is no wingbox outboard of
+        # it, so drawing spars across the winglet would invent structure. The LE
+        # and TE are still drawn to the tip, because the wing is there.
+        keep = y_full <= Y_JUNCTION_IN + 1e-6
+        y = y_full[keep]
+        x_le, x_te = m[0, keep, 0], m[-1, keep, 0]
         chord = x_te - x_le
         pct = float(r[STRAIGHT_LINE_KEY])
-        sp_aft = np.array([float(rear_spar_fraction(v, schedule)) for v in y])
+        sp_aft = np.array([float(rear_spar_fraction(v, sched_of(r))) for v in y])
         x_fwd = x_le + w2.FRONT_PCT * chord
         x_aft = x_le + sp_aft * chord
-        x_str = x_le + pct * chord
 
+        # LE/TE stop at the junction too: outboard of it is winglet, and drawing it
+        # here only adds a steep curve that reads as a boundary of the box.
         ax.plot(y, x_le, color="0.55", lw=1.2)
         ax.plot(y, x_te, color="0.55", lw=1.2, label="LE / TE")
-        ax.fill_between(y, x_fwd, x_aft, color=c, alpha=0.22, lw=0)
+        # Grey fill on every panel: the box is the same object in all three, and a
+        # per-arc colour here would imply the fill means something it does not.
+        # No straight `wingbox_pct` line either -- it is a construction fraction,
+        # not a member, and a phantom line inside a structural plot reads as one.
+        # Where an arc holds a spar straight, that spar is visibly straight.
+        ax.fill_between(y, x_fwd, x_aft, color="0.55", alpha=0.25, lw=0)
         ax.plot(y, x_fwd, color="#2B6CB0", lw=2.0, label=f"fwd spar {w2.FRONT_PCT:.2f}c")
-        ax.plot(y, x_aft, color="#C44E52", lw=2.0, label="aft spar 0.750c→0.550c")
-        ax.plot(y, x_str, color="k", lw=1.5, ls=(0, (5, 2.5)),
-                label=f"STRAIGHT line ({pct:.3f}c)")
-        for ys_ in NACELLES:
+        _sc = sched_of(r)
+        _lab = (f"aft spar {_sc[0][1]:.3f}c" if abs(_sc[0][1] - _sc[-1][1]) < 1e-9
+                else f"aft spar {_sc[0][1]:.3f}c→{_sc[-1][1]:.3f}c")
+        ax.plot(y, x_aft, color="#C44E52", lw=2.0, label=_lab)
+        for ys_, lab in NACELLES.items():
             ax.axvline(ys_, color="0.45", ls=":", lw=0.9)
-        ax.axvline(0.90 * 708.0, color="#8172B2", ls="--", lw=1.0)
+            if col == 0:
+                ax.annotate(lab, xy=(ys_, 0.02), xycoords=("data", "axes fraction"),
+                            rotation=90, fontsize=6.2, color="0.35",
+                            ha="right", va="bottom")
+        ax.axvline(Y_JUNCTION_IN, color="#0B7A75", lw=1.4)
+        ax.annotate("winglet junction", xy=(Y_JUNCTION_IN, x_aft[-1]),
+                    xytext=(-8, 22), textcoords="offset points", fontsize=6.8,
+                    color="#0B7A75", ha="right")
+        ax.set_xlim(-15, Y_JUNCTION_IN + 15)
         ax.invert_yaxis()                       # x down, as the planform panel does
         ax.set_xlabel("y, in")
         if col == 0:
             ax.set_ylabel("x, in")
-        held = "front spar" if abs(pct - w2.FRONT_PCT) < 1e-6 else "aft spar side"
-        ax.set_title(f"{nm} wingbox in plan — straight at {pct:.3f}c ({held})",
-                     fontsize=10)
+        held = ("front spar held straight" if abs(pct - w2.FRONT_PCT) < 1e-6
+                else f"straight at {pct:.3f}c, aft side")
+        ax.set_title(f"{nm} wingbox in plan — {held}", fontsize=10)
         ax.legend(fontsize=6.8, loc="upper left"); ax.grid(alpha=0.22)
 
     fig.suptitle("Best drag available inside each planform constraint class — full OAS at MTOW 382 547 N, "
