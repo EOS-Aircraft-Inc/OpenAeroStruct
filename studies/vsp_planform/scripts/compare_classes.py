@@ -311,9 +311,9 @@ if __name__ == "__main__":
     rets = [retention_fn(r.get("airfoil")) for r in res]
     span = [spanwise(r, schedule, rt) for r, rt in zip(res, rets)]
 
-    fig = plt.figure(figsize=(16.5, 19.5))
-    gs = fig.add_gridspec(5, 3, height_ratios=[1.0, 1.2, 1.0, 1.0, 1.0],
-                          hspace=0.42, wspace=0.30, bottom=0.075)
+    fig = plt.figure(figsize=(16.5, 23))
+    gs = fig.add_gridspec(6, 3, height_ratios=[1.0, 1.2, 1.0, 1.0, 1.0, 1.15],
+                          hspace=0.42, wspace=0.30, bottom=0.088)
     names = [c[0] for c in CLASSES]
     # Bar ticks get the short name only -- "Arc A constant chord" and its
     # neighbours overlap. The line panels carry the full descriptor in the legend.
@@ -567,12 +567,56 @@ if __name__ == "__main__":
                  fontsize=10.5)
     ax.legend(fontsize=7.2); ax.grid(alpha=0.25)
 
+    # ================= THE WINGBOX IN PLAN =================
+    # The panel that makes the architectures legible. Every arc carries the SAME
+    # rear-spar RATIO schedule (0.750 at y=356 -> 0.550 at y=674.9) and the same
+    # 0.12c front spar -- those are study-wide inputs, not outputs of the
+    # architecture -- so a sloping aft-spar RATIO is not something an arc chose.
+    # What separates them is which chord fraction is held STRAIGHT, `wingbox_pct`,
+    # drawn dashed. Arc B pins it at the front spar, so its front spar is dead
+    # straight and the box narrows from the back; Arc A and Arc C let it optimize
+    # near the aft spar, so their aft spar is the straight one and the box loses
+    # its front. Plan L is left out: its spar is a least-squares fit to the
+    # as-built loft, not a scheduled box, so it has no comparable straight line.
+    for col, ((nm, c, tag), r) in enumerate(zip(CLASSES, res)):
+        if tag == "reference":
+            continue
+        ax = fig.add_subplot(gs[5, col])
+        m = r["mesh"] / config.SCALE
+        y = np.abs(m[0, :, 1])
+        x_le, x_te = m[0, :, 0], m[-1, :, 0]
+        chord = x_te - x_le
+        pct = float(r[STRAIGHT_LINE_KEY])
+        sp_aft = np.array([float(rear_spar_fraction(v, schedule)) for v in y])
+        x_fwd = x_le + w2.FRONT_PCT * chord
+        x_aft = x_le + sp_aft * chord
+        x_str = x_le + pct * chord
+
+        ax.plot(y, x_le, color="0.55", lw=1.2)
+        ax.plot(y, x_te, color="0.55", lw=1.2, label="LE / TE")
+        ax.fill_between(y, x_fwd, x_aft, color=c, alpha=0.22, lw=0)
+        ax.plot(y, x_fwd, color="#2B6CB0", lw=2.0, label=f"fwd spar {w2.FRONT_PCT:.2f}c")
+        ax.plot(y, x_aft, color="#C44E52", lw=2.0, label="aft spar 0.750c→0.550c")
+        ax.plot(y, x_str, color="k", lw=1.5, ls=(0, (5, 2.5)),
+                label=f"STRAIGHT line ({pct:.3f}c)")
+        for ys_ in NACELLES:
+            ax.axvline(ys_, color="0.45", ls=":", lw=0.9)
+        ax.axvline(0.90 * 708.0, color="#8172B2", ls="--", lw=1.0)
+        ax.invert_yaxis()                       # x down, as the planform panel does
+        ax.set_xlabel("y, in")
+        if col == 0:
+            ax.set_ylabel("x, in")
+        held = "front spar" if abs(pct - w2.FRONT_PCT) < 1e-6 else "aft spar side"
+        ax.set_title(f"{nm} wingbox in plan — straight at {pct:.3f}c ({held})",
+                     fontsize=10)
+        ax.legend(fontsize=6.8, loc="upper left"); ax.grid(alpha=0.22)
+
     fig.suptitle("Best drag available inside each planform constraint class — full OAS at MTOW 382 547 N, "
                  "span pinned at 118 ft, all trimmed to the same lift\n"
                  f"Arc A / B / C carry the {TOC_NOTE} profile; Plan L is the as-built loft",
                  fontsize=12)
-    fig.text(0.5, 0.048, DEFINITIONS, ha="center", fontsize=10, fontweight="bold")
-    fig.text(0.5, 0.020,
+    fig.text(0.5, 0.058, DEFINITIONS, ha="center", fontsize=10, fontweight="bold")
+    fig.text(0.5, 0.028,
              "All percentages are against PLAN L AS-BUILT. Drag is NOT the merit function: the study ranks on electric range at fixed MTOW (m_batt/D), break-even "
              f"{BREAK_EVEN_LB_PER_N:.3f} lb of wing per newton,\nso 'may weigh' is how much heavier each architecture can be and still match Plan L on range -- and the bottom row now plots that range directly. "
              "Wing-only drag throughout. Depth and width use EACH design's own section retention.\nDesign points: Arc A = wing 8, Arc B = wing 7, Arc C = wing 3.",
