@@ -54,7 +54,18 @@ SEMI_IN, Y_AIL = 708.0, 0.90 * 708.0
 DEPTH_REQ = 6.0
 SCHEDULE = ((356.0, 0.750), (674.9, 0.550))
 TOL_IN, MAX_PASS = 0.005, 5
-W_SEED_LB, W_PASSES, W_TOL_LB = 8000.0, 4, 25.0
+W_SEED_LB, W_TOL_LB = 8000.0, 25.0
+# The weight loop is a damped fixed point (w += 0.5 * residual) and it contracts by
+# ~0.45 a pass, so 4 passes lands within ~80 lb -- close, but over the 25 lb
+# tolerance, which is why those weights are reported flagged. 7-8 clears it. This is
+# overridable rather than simply raised because more passes is the ONE lever that
+# turns a flagged weight into a converged one and it costs only time, and because it
+# does not help every case equally: the `optimal` profiles converge honestly
+# (df/dw -0.17 to -0.23, the right sign for weight relief) while A_capped stalls at a
+# residual ratio of 0.968 with a POSITIVE df/dw, meaning sizer noise of +-30-50 lb is
+# already swamping the real sensitivity there. More passes would converge that one
+# cosmetically, not honestly.
+W_PASSES = int(os.environ.get("ARC_W_PASSES", "4"))
 
 PROFILES = {                    # (root t/c, tip/root) -> the 5 spline control points
     "optimal": (0.250, 0.58),   # the sweep's peak, 344.0 nmi
