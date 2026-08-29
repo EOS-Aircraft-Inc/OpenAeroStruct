@@ -166,7 +166,10 @@ def write_spar_csv(path, name, ws, chord, le, te, toc, rear, depth, box, note,
     width = (rear - front) * chord
     knots = ", ".join(f"({y:.1f} in, {v:.4f}c)" for y, v in sched)
 
-    wing = ws <= y_c
+    # The junction station itself belongs to the box -- it carries the junction
+    # width requirement -- so the comparison is tolerant of the mesh node landing
+    # a thousandth of an inch outboard of the region boundary.
+    wing = ws <= y_c + 0.05
     cx = te[:, 0] - le[:, 0]
     p_, K_ = box.get("wingbox_pct"), box.get("K_in")
     dev = float(box.get("spar_max_dev_in", float("nan")))
@@ -242,9 +245,15 @@ def write_spar_csv(path, name, ws, chord, le, te, toc, rear, depth, box, note,
         fh.write("# depth_in is the thickness of THIS station's exported contour at the\n")
         fh.write("#   rear spar, times the chord. It reproduces the study's own depth,\n")
         fh.write("#   retention * t/c * chord, because the contour carries both.\n")
-        fh.write(f"# region: wing to the winglet junction at y = {y_c:.1f} in, winglet\n")
-        fh.write("#   outboard of it. The winglet is welded to the junction and its box is\n")
-        fh.write("#   NOT sized by this study; its rows are geometry, not a requirement.\n")
+        fh.write(f"# region: wing to the winglet junction at y = {y_c:.2f} in, winglet\n")
+        fh.write("#   outboard of it. THE WINGBOX ENDS AT THE JUNCTION -- the winglet is\n")
+        fh.write("#   welded to the tip and carries no box this study sized, so the spar\n")
+        fh.write("#   columns are EMPTY on those rows. Their geometry is still given.\n")
+        fh.write("#   Continuing either definition of the spar past the junction invents\n")
+        fh.write("#   structure and misreports it: the schedule, held flat outside its last\n")
+        fh.write("#   knot, marches the spar 3.4 in forward as the winglet chord collapses,\n")
+        fh.write("#   and the p + K/c rule reaches 1.01c at the tip -- behind the trailing\n")
+        fh.write("#   edge. Neither is a spar. The wing rows are the box.\n")
         for line in straight:
             fh.write(line + "\n")
         fh.write(f"# AT THE AILERON, y = {Y_AIL_IN:.1f} in -- the station the depth\n")
@@ -260,11 +269,13 @@ def write_spar_csv(path, name, ws, chord, le, te, toc, rear, depth, box, note,
                  "x_le_in,x_front_in,x_rear_in,x_te_in,z_front_in,z_rear_in,"
                  "box_width_in,depth_in\n")
         for i in range(len(ws)):
-            fh.write(
-                f"{i},{ws[i]:.3f},{'wing' if ws[i] <= y_c else 'winglet'},"
-                f"{chord[i]:.6f},{toc[i]:.6f},{front:.4f},{rear[i]:.4f},"
-                f"{le[i, 0]:.4f},{x_f[i]:.4f},{x_r[i]:.4f},{te[i, 0]:.4f},"
-                f"{z_f[i]:.4f},{z_r[i]:.4f},{width[i]:.4f},{depth[i]:.4f}\n")
+            # Geometry on every row; the box only where there IS a box.
+            spars = (f"{front:.4f},{rear[i]:.4f},{le[i, 0]:.4f},{x_f[i]:.4f},"
+                     f"{x_r[i]:.4f},{te[i, 0]:.4f},{z_f[i]:.4f},{z_r[i]:.4f},"
+                     f"{width[i]:.4f},{depth[i]:.4f}" if wing[i] else
+                     f",,{le[i, 0]:.4f},,,{te[i, 0]:.4f},,,,")
+            fh.write(f"{i},{ws[i]:.3f},{'wing' if wing[i] else 'winglet'},"
+                     f"{chord[i]:.6f},{toc[i]:.6f},{spars}\n")
     return path
 
 
