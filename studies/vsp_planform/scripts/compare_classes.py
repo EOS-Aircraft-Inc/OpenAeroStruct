@@ -286,7 +286,7 @@ def replay(case, y_a_in, rule):
             return sd
         ro.build_surface = _surface
     try:
-        prob, _, _, _, _ = w2.build(w2.BASELINE, y_a_in)
+        prob, _, _, regions, _ = w2.build(w2.BASELINE, y_a_in)
         prob.set_val("wing.taper_B", case["taper_B"])
         prob.set_val("wing.wingbox_pct", case["wingbox_pct"])
         prob.set_val("wing.twist_cp", np.array(case["twist_cp"]), units="deg")
@@ -317,6 +317,14 @@ def replay(case, y_a_in, rule):
             "constraint_width_in": (np.asarray(prob.get_val("wingbox_width", units="m"))
                                     [:len(stations)] / config.SCALE),
             "constraint_stations": stations,
+            # The box this wing was replayed with, so a caller that exports the
+            # geometry can export the SPARS too rather than guess at them. A
+            # design point written before these were recorded falls back to the
+            # study schedule above, and that fallback is resolved here -- once --
+            # instead of once per caller.
+            "rear_schedule": tuple((float(a_), float(b_)) for a_, b_ in schedule),
+            "front_pct": float(w2.FRONT_PCT),
+            "y_c_start_in": float(regions.y_c_start),
             # retention belongs to the section, so the depth panel must use this
             "airfoil": case.get("airfoil"),
             STRAIGHT_LINE_KEY: float(prob.get_val("wing.wingbox_pct")[0])}

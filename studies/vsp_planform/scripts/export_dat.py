@@ -5,7 +5,14 @@ deck), so this is that export packaged the way the airfoil zips are shipped:
 
     <name>/
         <name>_af.csv                  airfoil metadata, one block per station
+        <name>_spar.csv                both spars, one row per station
         <name>_<GeomID>_<i>.dat        Selig contour, one per station
+
+A VSP bundle is an OUTER SURFACE and nothing else, so on its own it cannot say
+where the wingbox sits -- and the wingbox is what every number in this study was
+sized on. ``<name>_spar.csv`` is added for that: both spar lines and the box
+depth at every exported station, derived from the SAME mesh and the SAME
+contours as the .dat files, so the two cannot disagree.
 
 The metadata block matches the format of the reference bundles
 (Inputs/V3.5.3/OpenVSP/S12_t0.zip and the S12_t2.zip the tool is driven from),
@@ -60,6 +67,7 @@ from studies.vsp_planform.coupling.geometry import normalized_sections, section_
 import wing2_oas as w2                                           # noqa: E402
 from wing8_constchord_toc import REGION_A_AS_BUILT_IN            # noqa: E402
 from compare_classes import replay, baseline_case                # noqa: E402
+from studies.vsp_planform.param import rear_spar_fraction        # noqa: E402
 
 LOGS = Path(os.path.dirname(os.path.dirname(_HERE))) / "out" / "logs"
 # One folder for wing geometry hand-offs, beside the logs and figures.
@@ -116,9 +124,135 @@ def blended_profile(blend, x_grid):
     return at
 
 
+SEMI_IN = 708.0
+# The aileron station the depth requirement is written at (arc_optimal_toc.Y_AIL).
+# Quoted in the table header so a reader can check the headline depth without
+# rebuilding anything.
+Y_AIL_IN = 0.90 * SEMI_IN
+
+
+def write_spar_csv(path, name, ws, chord, le, te, toc, rear, depth, box, note,
+                   retention_at):
+    """Both spar lines and the box depth, one row per exported station.
+
+    The spars are the whole reason the planform is the shape it is -- the 7 in
+    aileron depth sets the chord through ``depth = retention * t/c * chord`` --
+    and a VSP bundle carries no such thing. So they are written beside the
+    contours, in the same frame and the same units as ``_af.csv``.
+
+    Everything here is read off the exported geometry, not off the design point:
+    the chord and the spar positions come from the mesh, and the depth is
+    measured on the contour at the rear spar. A reader can therefore check every
+    number in the README against the files, which is the point of shipping it.
+
+    ``retention_at(y, x)`` gives the section's thickness at chord fraction ``x``
+    as a fraction of its own maximum, at ANY y. The aileron is not one of the
+    exported stations, and on Arc A the section blend ends exactly there, so the
+    depth has a KINK at the aileron and interpolating the rows across it reads
+    0.03 in low. The requirement is written at that station, so it is computed
+    there rather than interpolated.
+    """
+    front = float(box["front_pct"])
+    y_c = float(box["y_c_start_in"])
+    sched = box["rear_schedule"]
+
+    # Both spars lie on the chord line, so x and z interpolate between the
+    # leading and trailing edge points of the same station.
+    def on_chord(f, col):
+        return le[:, col] + f * (te[:, col] - le[:, col])
+
+    x_f, z_f = on_chord(front, 0), on_chord(front, 2)
+    x_r, z_r = on_chord(rear, 0), on_chord(rear, 2)
+    width = (rear - front) * chord
+    knots = ", ".join(f"({y:.1f} in, {v:.4f}c)" for y, v in sched)
+
+    # The aileron: the station the depth requirement is written at, computed
+    # there rather than interpolated between the rows that bracket it.
+    wing = ws <= y_c
+    rear_a = float(rear_spar_fraction(Y_AIL_IN, sched))
+    chord_a = float(np.interp(Y_AIL_IN, ws, chord))
+    depth_a = retention_at(Y_AIL_IN, rear_a) * float(np.interp(Y_AIL_IN, ws, toc)) * chord_a
+    depth_lin = float(np.interp(Y_AIL_IN, ws, depth))
+
+    # How straight the spar in this table actually is. The model samples the
+    # spar as a schedule that is linear in y between its knots; a straight spar
+    # is rear(y) = p + K/c(y), which is not linear in y. So a design that asks
+    # for a straight aft spar gets one at the knots and a slight bow between
+    # them, and the bundle must not quietly hide that.
+    cx = te[:, 0] - le[:, 0]
+    p_, K_ = box.get("wingbox_pct"), box.get("K_in")
+    spread_f, spread_r = float(np.ptp(x_f[wing])), float(np.ptp(x_r[wing]))
+    rule = ["#             The parameterization holds one line straight by construction,",
+            f"#             at p = {p_:.4f}c. That line is INSIDE the box, not an edge of",
+            "#             it (param.py); it is a spar only where p equals a spar fraction."]
+    if K_:
+        rule += [
+            "#             This design asks for a STRAIGHT AFT spar, rear(y) = p + K/c(y)",
+            f"#             with K = {K_:.2f} in. The schedule is the model's 5-knot sample",
+            "#             of that rule and it interpolates LINEARLY IN Y between the",
+            "#             knots, which the rule does not. On the rule itself these",
+            f"#             stations hold x_rear to "
+            f"{float(np.ptp((le[:, 0] + p_ * cx + K_)[wing])):.2f} in; the "
+            f"{spread_r:.2f} in above is that",
+            "#             plus the bow the linear schedule puts between the knots."]
+    # The README quotes these same measurements, so they are recorded here rather
+    # than measured twice and allowed to drift apart.
+    box["x_front_spread_in"], box["x_rear_spread_in"] = spread_f, spread_r
+
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(f"# {name} wingbox -- spar positions and box depth\n")
+        fh.write("# INCHES, aircraft frame, the same frame and stations as "
+                 f"{name}_af.csv (x aft, y right, z up).\n")
+        fh.write("#\n")
+        fh.write(f"# FRONT SPAR  {front:.4f}c at every station, constant.\n")
+        fh.write(f"# REAR SPAR   scheduled in y: {knots}\n")
+        fh.write("#             linear between the knots, held flat outside them.\n")
+        fh.write(f"#             {note}\n")
+        fh.write("# Both spars lie on the chord line: x = x_le + pct * (x_te - x_le),\n")
+        fh.write("#   and z likewise. box_width_in is (rear_pct - front_pct) * chord_in,\n")
+        fh.write("#   measured ALONG the chord line. The model constrains the same width\n")
+        fh.write("#   on the chordwise x-extent instead, which is shorter by the cosine of\n")
+        fh.write("#   the chord line angle -- under 0.2%, about 0.12 in on a 65 in box.\n")
+        fh.write("# depth_in is the thickness of THIS station's exported contour at the\n")
+        fh.write("#   rear spar, times the chord. It reproduces the study's own depth,\n")
+        fh.write("#   retention * t/c * chord, because the contour carries both.\n")
+        fh.write(f"# region: wing to the winglet junction at y = {y_c:.1f} in, winglet\n")
+        fh.write("#   outboard of it. The winglet is welded to the junction and its box is\n")
+        fh.write("#   NOT sized by this study; its rows are geometry, not a requirement.\n")
+        fh.write(f"# STRAIGHTNESS over the wing rows: x_front varies by {spread_f:.2f} in,\n")
+        fh.write(f"#             x_rear by {spread_r:.2f} in.\n")
+        for line in rule:
+            fh.write(line + "\n")
+        fh.write(f"# AT THE AILERON, y = {Y_AIL_IN:.1f} in -- the station the depth\n")
+        fh.write("#   requirement is written at, and NOT one of the exported stations:\n")
+        fh.write(f"#   rear spar {rear_a:.4f}c, chord {chord_a:.2f} in, depth "
+                 f"{depth_a:.2f} in.\n")
+        fh.write("#   Computed from the section at that y. Interpolating depth_in\n")
+        fh.write(f"#   between the two rows that bracket it gives {depth_lin:.2f} in "
+                 f"instead"
+                 + (", because\n#   the section blend ends exactly here and the depth "
+                    "has a kink at it.\n" if abs(depth_a - depth_lin) > 0.01 else ".\n"))
+        fh.write("station,y_in,region,chord_in,t_over_c,front_pct,rear_pct,"
+                 "x_le_in,x_front_in,x_rear_in,x_te_in,z_front_in,z_rear_in,"
+                 "box_width_in,depth_in\n")
+        for i in range(len(ws)):
+            fh.write(
+                f"{i},{ws[i]:.3f},{'wing' if ws[i] <= y_c else 'winglet'},"
+                f"{chord[i]:.6f},{toc[i]:.6f},{front:.4f},{rear[i]:.4f},"
+                f"{le[i, 0]:.4f},{x_f[i]:.4f},{x_r[i]:.4f},{te[i, 0]:.4f},"
+                f"{z_f[i]:.4f},{z_r[i]:.4f},{width[i]:.4f},{depth[i]:.4f}\n")
+    return path
+
+
 def export(mesh_m, toc, name, geom_id, out_dir, n_x=201, dir_hint=None, airfoil=None,
-           blend=None):
-    """Write <name>_af.csv plus one .dat per spanwise station. Returns the paths."""
+           blend=None, box=None, box_note=""):
+    """Write the .dat contours, <name>_af.csv and <name>_spar.csv. Returns the paths.
+
+    ``box`` is the wingbox this design was run with -- ``front_pct``,
+    ``rear_schedule`` and the winglet junction -- as :func:`compare_classes.replay`
+    returns it. Given it, the spar table is written; without it the bundle is the
+    outer surface alone, which is what it used to be.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     comp = list(lifting_surfaces(read_degen_csv(config.BASELINES[w2.BASELINE])).values())[0][0]
     frac, x_n, up_n, lo_n = normalized_sections(comp.plate, comp.stick)
@@ -137,13 +271,35 @@ def export(mesh_m, toc, name, geom_id, out_dir, n_x=201, dir_hint=None, airfoil=
     # cosine spacing, clustered at the leading edge where curvature is highest
     x_grid = 0.5 * (1 - np.cos(np.linspace(0.0, np.pi, n_x)))
 
+    # The rear spar is scheduled in y and the front spar is a constant fraction,
+    # so both are known at every station the contours are written at.
+    rear = (rear_spar_fraction(ws, box["rear_schedule"]) if box else None)
+
     hint = dir_hint or f"./{name}/"
     # A named section is the same shape at every station, so its camber and
     # thickness are built once; only the t/c scale changes down the span.
     db = None if airfoil in (None, "", "as-built") else database_profile(airfoil, x_grid)
     # A spanwise pair overrides the single section: the contour changes down the span.
     db_at = blended_profile(blend, x_grid) if blend else None
-    blocks, dats = [], []
+
+    def retention_at(y_in, xc):
+        """Section thickness at chord fraction ``xc``, over its own maximum, at any y.
+
+        The same quantity the study calls RETENTION, and the reason it is worth
+        having off-station: depth = retention * t/c * chord is how the aileron
+        requirement sets the chord, and the aileron is between two stations.
+        """
+        if db_at is not None:
+            t_n = db_at(y_in)[1]
+        elif db is not None:
+            t_n = db[1]
+        else:
+            f_ = 0.0 if span1 == span0 else (y_in - span0) / (span1 - span0)
+            u_, l_ = section_at(f_, frac, x_n, up_n, lo_n, x_grid)
+            t_n = u_ - l_
+        return float(np.interp(xc, x_grid, t_n)) / float(np.max(t_n))
+
+    blocks, dats, depths = [], [], []
     for i in range(ny):
         f = 0.0 if span1 == span0 else (ws[i] - span0) / (span1 - span0)
         if db_at is not None:
@@ -167,6 +323,13 @@ def export(mesh_m, toc, name, geom_id, out_dir, n_x=201, dir_hint=None, airfoil=
         write_dat(out_dir / dat, hint + dat, x_grid, up, lo)
         dats.append(out_dir / dat)
         blocks.append((dat, i, le[i], te[i], chord[i], f))
+        # Box depth read off THIS station's exported contour rather than
+        # recomputed from the section: the two agree by construction -- the
+        # contour carries the design's t/c and the section's retention -- and
+        # reading it here is what makes the table impossible to disagree with
+        # the .dat files it ships beside.
+        if box:
+            depths.append(float(np.interp(rear[i], x_grid, up - lo)) * chord[i])
 
     csv_path = out_dir / f"{name}_af.csv"
     with csv_path.open("w", encoding="utf-8", newline="\n") as fh:
@@ -187,11 +350,39 @@ def export(mesh_m, toc, name, geom_id, out_dir, n_x=201, dir_hint=None, airfoil=
             fh.write(f"Trailing Edge Point, {tep[0]:.6f}, {tep[1]:.6f}, {tep[2]:.6f}\n")
             fh.write(f"Chord, {c:.6f}\n")
             fh.write("#" * 40 + "\n\n")
-    return csv_path, dats
+
+    spar_path = None
+    if box:
+        spar_path = write_spar_csv(out_dir / f"{name}_spar.csv", name, ws, chord,
+                                   le, te, toc_node, rear, np.array(depths), box,
+                                   box_note, retention_at)
+    return csv_path, spar_path, dats
+
+
+SCHED_RECORDED = ("Source: recorded in the design point, so this is the box the "
+                  "design was run on.")
+# Arc B and Arc C were solved before the schedule was written into the design
+# point, so replay() falls back to the study schedule for them -- the same one
+# they were optimized with. Saying which of the two a bundle carries is the
+# difference between a spar a reader can trust and a spar they have to check.
+SCHED_DEFAULT = ("Source: the study schedule (wing5_mtow.stations_and_schedule); "
+                 "this design point predates the recording of its own.")
+
+
+def box_of(r, case):
+    """The wingbox replay() built this wing with, plus where its schedule came from."""
+    box = {k: r[k] for k in ("front_pct", "rear_schedule", "y_c_start_in")}
+    # The straight-spar rule, where the design has one. The schedule is the
+    # model's 5-knot sample of it, and the two are not the same line between the
+    # knots -- which the spar table has to say out loud, on a design whose whole
+    # claim is a straight aft spar.
+    box["wingbox_pct"] = case.get("wingbox_pct")
+    box["K_in"] = case.get("K_in")
+    return box, (SCHED_RECORDED if case.get("rear_schedule") else SCHED_DEFAULT)
 
 
 def load_design(arc):
-    """Replay the arc's design point and return (mesh_m, toc, provenance)."""
+    """Replay the arc's design point and return (mesh_m, toc, provenance, box)."""
     y_a, rule, (fname, key) = ARCS[arc]
     # Prefer a t/c-optimised design point when one has been produced. The
     # section is part of the file's identity, so it is named here too -- a bundle
@@ -210,7 +401,7 @@ def load_design(arc):
                     r = replay(case, y_a, rule)
                     return (r["mesh"], r["toc"], case.get("airfoil") or "as-built",
                             f"{pc.name} ({prof} t/c, CONSTRUCTED straight aft spar)",
-                            case)
+                            case) + box_of(r, case)
                 print(f"  NOTE: {pc.name} is not feasible -- not exported")
     for prof in ("optimal", "capped"):
         p = LOGS / f"arc_optimal_toc_{arc}_{prof}{sfx}.json"
@@ -221,10 +412,12 @@ def load_design(arc):
             # rather than the environment, so a bundle cannot be exported on a
             # section the aero was never run with.
             sec = case.get("airfoil") or "as-built"
-            return r["mesh"], r["toc"], sec, f"{p.name} ({sec}, {prof} t/c)", case
+            return (r["mesh"], r["toc"], sec, f"{p.name} ({sec}, {prof} t/c)",
+                    case) + box_of(r, case)
     case = json.loads((LOGS / fname).read_text())[key]
     r = replay(case, y_a, rule)
-    return r["mesh"], r["toc"], "as-built", f"{fname}:{key} (as-built t/c)", case
+    return (r["mesh"], r["toc"], "as-built", f"{fname}:{key} (as-built t/c)",
+            case) + box_of(r, case)
 
 
 ARCH_NOTE = {
@@ -234,7 +427,13 @@ ARCH_NOTE = {
 }
 
 
-def write_readme(path, arc, case, prov, n_stations, n_x):
+def _wrap(text, indent, width=76):
+    """Wrap one README line, hanging the continuation under its label."""
+    import textwrap
+    return textwrap.wrap(text, width=width, subsequent_indent=" " * indent) or [text]
+
+
+def write_readme(path, arc, case, prov, n_stations, n_x, box=None, box_note=""):
     """What a reader of this bundle has to know, shipped inside the bundle.
 
     The .dat files and _af.csv are pure geometry in the VSP format -- nothing in
@@ -258,6 +457,7 @@ def write_readme(path, arc, case, prov, n_stations, n_x):
         "",
         "CONTENTS",
         f"  Arc{arc}_af.csv                  airfoil metadata, one block per station",
+        f"  Arc{arc}_spar.csv                both spars and the box depth, one row per station",
         f"  Arc{arc}_<GeomID>_<i>.dat        Selig contour, one per station",
         f"  {n_stations} stations, {n_x} points per contour.",
         "  Contours are normalized by local chord. Selig order: trailing edge along",
@@ -276,12 +476,35 @@ def write_readme(path, arc, case, prov, n_stations, n_x):
          "  MTOW subject to the box-width requirements, trim, and an area floor."),
         "",
     ] + ([
+        "WINGBOX -- WHERE THE SPARS ARE",
+        f"  Arc{arc}_spar.csv gives both spar lines at every one of the "
+        f"{n_stations} stations,",
+        "  in inches in the aircraft frame: chord fraction, x and z on the chord line,",
+        "  box width and box depth. A VSP bundle is an outer surface and carries none",
+        "  of that, and the box is what this wing was sized on, so it ships here.",
+        f"  front spar   {box['front_pct']:.4f}c at every station, constant.",
+    ] + _wrap("  rear spar    scheduled in y: "
+              + ", ".join(f"({y:.1f} in, {v:.4f}c)" for y, v in box["rear_schedule"]),
+              15) + [
+        "               linear between the knots, held flat outside them.",
+    ] + _wrap(f"               {box_note}", 15) + [
+        "  depth        measured on the exported contour at the rear spar and",
+        "               multiplied by the chord, so it reproduces the study's own",
+        "               depth = retention * t/c * chord from the shipped files.",
+        "",
+    ] if box else []) + ([
         "AFT SPAR -- STRAIGHT",
         f"  rear(y) = p + K/c(y) with p = {case.get('wingbox_pct', float('nan')):.4f} and "
         f"K = {case.get('K_in', float('nan')):.2f} in,",
-        "  which puts the spar at CONSTANT x from root to winglet junction. Verified on",
-        f"  the built geometry: its offset from the construction line varies by "
-        f"{case.get('x_aft_spread_in', float('nan')):.4f} in.",
+        "  which puts the spar at CONSTANT x from root to winglet junction. The",
+        f"  schedule the model carries reproduces that rule to "
+        f"{case.get('x_aft_spread_in', float('nan')):.4f} in AT ITS 5 KNOTS,",
+        "  which is where the box constraints are read. Measured on the EXPORTED MESH",
+        f"  the tabulated spar holds x to "
+        f"{(box or {}).get('x_rear_spread_in', float('nan')):.2f} in instead: the schedule",
+        "  interpolates linearly in y between the knots and the rule does not, so the",
+        f"  spar bows a little between them. Arc{arc}_spar.csv reports both, and gives",
+        "  the spar station by station so the bow can be seen rather than taken on trust.",
         "  K is set by the hardest-binding box-width station, not chosen.",
         "  Consequence worth knowing: constant x is a LARGER chord fraction where the",
         "  chord is smaller, so the spar moves aft in section terms going outboard --",
@@ -357,17 +580,19 @@ if __name__ == "__main__":
     GEOMS.mkdir(parents=True, exist_ok=True)
     for arc in arcs:
         name = f"Arc{arc}"
-        mesh, toc, sec, prov, case = load_design(arc)
+        mesh, toc, sec, prov, case, box, box_note = load_design(arc)
         work = GEOMS / name
-        csv_path, dats = export(mesh, toc, name, GEOM_ID[arc], work,
-                                n_x=a.n_x, airfoil=sec,
-                                blend=case.get("section_blend"))
+        csv_path, spar_path, dats = export(mesh, toc, name, GEOM_ID[arc], work,
+                                           n_x=a.n_x, airfoil=sec,
+                                           blend=case.get("section_blend"),
+                                           box=box, box_note=box_note)
         rd = write_readme(work / f"{name}_README.txt", arc, case, prov,
-                          len(dats), a.n_x)
+                          len(dats), a.n_x, box=box, box_note=box_note)
         zpath = GEOMS / f"{name}.zip"
         with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(rd, f"{name}/{rd.name}")
             zf.write(csv_path, f"{name}/{csv_path.name}")
+            zf.write(spar_path, f"{name}/{spar_path.name}")
             for d in dats:
                 zf.write(d, f"{name}/{d.name}")
         print(f"  {name}: {len(dats)} stations, {a.n_x} pts/contour -> {zpath.name} "
