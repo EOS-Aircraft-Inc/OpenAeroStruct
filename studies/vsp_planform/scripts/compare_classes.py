@@ -286,7 +286,7 @@ def replay(case, y_a_in, rule):
             return sd
         ro.build_surface = _surface
     try:
-        prob, _, _, regions, _ = w2.build(w2.BASELINE, y_a_in)
+        prob, _, _, regions, planform0 = w2.build(w2.BASELINE, y_a_in)
         prob.set_val("wing.taper_B", case["taper_B"])
         prob.set_val("wing.wingbox_pct", case["wingbox_pct"])
         prob.set_val("wing.twist_cp", np.array(case["twist_cp"]), units="deg")
@@ -324,6 +324,11 @@ def replay(case, y_a_in, rule):
             # instead of once per caller.
             "rear_schedule": tuple((float(a_), float(b_)) for a_, b_ in schedule),
             "front_pct": float(w2.FRONT_PCT),
+            # How straight the BASELINE's own spar line is, inches. It is the floor
+            # on the straightness of anything lofted from it: the parameterization
+            # scales the baseline, so it preserves this departure rather than
+            # removing it.
+            "spar_max_dev_in": float(planform0["spar_max_dev"]),
             "y_c_start_in": float(regions.y_c_start),
             # retention belongs to the section, so the depth panel must use this
             "airfoil": case.get("airfoil"),

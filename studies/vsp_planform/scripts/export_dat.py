@@ -166,38 +166,65 @@ def write_spar_csv(path, name, ws, chord, le, te, toc, rear, depth, box, note,
     width = (rear - front) * chord
     knots = ", ".join(f"({y:.1f} in, {v:.4f}c)" for y, v in sched)
 
-    # The aileron: the station the depth requirement is written at, computed
-    # there rather than interpolated between the rows that bracket it.
     wing = ws <= y_c
-    rear_a = float(rear_spar_fraction(Y_AIL_IN, sched))
+    cx = te[:, 0] - le[:, 0]
+    p_, K_ = box.get("wingbox_pct"), box.get("K_in")
+    dev = float(box.get("spar_max_dev_in", float("nan")))
+
+    # The aileron: the station the depth requirement is written at, computed
+    # there rather than interpolated between the rows that bracket it, and on
+    # whichever definition of the rear spar the rows themselves carry.
+    cx_a = float(np.interp(Y_AIL_IN, ws, cx))
+    rear_a = (p_ + K_ / cx_a) if K_ else float(rear_spar_fraction(Y_AIL_IN, sched))
     chord_a = float(np.interp(Y_AIL_IN, ws, chord))
     depth_a = retention_at(Y_AIL_IN, rear_a) * float(np.interp(Y_AIL_IN, ws, toc)) * chord_a
     depth_lin = float(np.interp(Y_AIL_IN, ws, depth))
 
-    # How straight the spar in this table actually is. The model samples the
-    # spar as a schedule that is linear in y between its knots; a straight spar
-    # is rear(y) = p + K/c(y), which is not linear in y. So a design that asks
-    # for a straight aft spar gets one at the knots and a slight bow between
-    # them, and the bundle must not quietly hide that.
-    cx = te[:, 0] - le[:, 0]
-    p_, K_ = box.get("wingbox_pct"), box.get("K_in")
     spread_f, spread_r = float(np.ptp(x_f[wing])), float(np.ptp(x_r[wing]))
-    rule = ["#             The parameterization holds one line straight by construction,",
-            f"#             at p = {p_:.4f}c. That line is INSIDE the box, not an edge of",
-            "#             it (param.py); it is a spar only where p equals a spar fraction."]
+    # What the model's schedule would give at these stations, for a reader who
+    # takes the knots and interpolates them. It is not what the rows carry, and
+    # on a straight-spar design the difference is worth a number.
+    bow = (float(np.max(np.abs(rear_spar_fraction(ws, sched) - rear)[wing] * cx[wing]))
+           if K_ else 0.0)
+
     if K_:
-        rule += [
-            "#             This design asks for a STRAIGHT AFT spar, rear(y) = p + K/c(y)",
-            f"#             with K = {K_:.2f} in. The schedule is the model's 5-knot sample",
-            "#             of that rule and it interpolates LINEARLY IN Y between the",
-            "#             knots, which the rule does not. On the rule itself these",
-            f"#             stations hold x_rear to "
-            f"{float(np.ptp((le[:, 0] + p_ * cx + K_)[wing])):.2f} in; the "
-            f"{spread_r:.2f} in above is that",
-            "#             plus the bow the linear schedule puts between the knots."]
+        rear_block = [
+            f"# REAR SPAR   rear(y) = p + K/c(y) with p = {p_:.4f}c and K = {K_:.2f} in: a",
+            "#             spar at CONSTANT x, which is the whole point of this design.",
+            "#             The rows below carry THAT RULE. It is what the depth was",
+            "#             checked against along the span, and what a builder would cut.",
+            "#             The model samples the rule as a schedule and reads it ONLY at",
+            "#             the box-width stations, which are its knots (param.py:870):",
+            f"#               {knots}",
+            "#             Between the knots that schedule interpolates linearly in y and",
+            "#             the rule does not, so reading the schedule at these stations",
+            f"#             instead puts the spar up to {bow:.2f} in aft of the rows below.",
+            "#             Nothing in the model reads it there.",
+            f"#             {note}",
+        ]
+    else:
+        rear_block = [
+            f"# REAR SPAR   scheduled in y: {knots}",
+            "#             linear between the knots, held flat outside them.",
+            f"#             {note}",
+        ]
+
+    straight = [
+        f"# STRAIGHTNESS over the wing rows: x_front varies by {spread_f:.2f} in,",
+        f"#             x_rear by {spread_r:.2f} in.",
+        "#             The floor is the BASELINE. Its own spar line already departs",
+        f"#             from straight by up to {dev:.2f} in about its mean, and the",
+        "#             parameterization SCALES that baseline rather than rebuilding it,",
+        "#             so it carries the departure through. No design variable in this",
+        "#             study can beat it.",
+        "#             The parameterization holds one line straight by construction, at",
+        f"#             p = {p_:.4f}c. That line is INSIDE the box, not an edge of it",
+        "#             (param.py); it is a spar only where p equals a spar fraction.",
+    ]
     # The README quotes these same measurements, so they are recorded here rather
     # than measured twice and allowed to drift apart.
     box["x_front_spread_in"], box["x_rear_spread_in"] = spread_f, spread_r
+    box["schedule_bow_in"] = bow
 
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(f"# {name} wingbox -- spar positions and box depth\n")
@@ -205,9 +232,8 @@ def write_spar_csv(path, name, ws, chord, le, te, toc, rear, depth, box, note,
                  f"{name}_af.csv (x aft, y right, z up).\n")
         fh.write("#\n")
         fh.write(f"# FRONT SPAR  {front:.4f}c at every station, constant.\n")
-        fh.write(f"# REAR SPAR   scheduled in y: {knots}\n")
-        fh.write("#             linear between the knots, held flat outside them.\n")
-        fh.write(f"#             {note}\n")
+        for line in rear_block:
+            fh.write(line + "\n")
         fh.write("# Both spars lie on the chord line: x = x_le + pct * (x_te - x_le),\n")
         fh.write("#   and z likewise. box_width_in is (rear_pct - front_pct) * chord_in,\n")
         fh.write("#   measured ALONG the chord line. The model constrains the same width\n")
@@ -219,9 +245,7 @@ def write_spar_csv(path, name, ws, chord, le, te, toc, rear, depth, box, note,
         fh.write(f"# region: wing to the winglet junction at y = {y_c:.1f} in, winglet\n")
         fh.write("#   outboard of it. The winglet is welded to the junction and its box is\n")
         fh.write("#   NOT sized by this study; its rows are geometry, not a requirement.\n")
-        fh.write(f"# STRAIGHTNESS over the wing rows: x_front varies by {spread_f:.2f} in,\n")
-        fh.write(f"#             x_rear by {spread_r:.2f} in.\n")
-        for line in rule:
+        for line in straight:
             fh.write(line + "\n")
         fh.write(f"# AT THE AILERON, y = {Y_AIL_IN:.1f} in -- the station the depth\n")
         fh.write("#   requirement is written at, and NOT one of the exported stations:\n")
@@ -274,6 +298,15 @@ def export(mesh_m, toc, name, geom_id, out_dir, n_x=201, dir_hint=None, airfoil=
     # The rear spar is scheduled in y and the front spar is a constant fraction,
     # so both are known at every station the contours are written at.
     rear = (rear_spar_fraction(ws, box["rear_schedule"]) if box else None)
+    if box and box.get("K_in"):
+        # A design with a straight-spar rule is tabulated ON THE RULE. The model
+        # reads its schedule ONLY at the width stations (param.py:870), which for
+        # this design ARE the knots, so the schedule's linear-in-y interpolation
+        # between them is not part of the design -- and rear(y) = p + K/c(y) is
+        # what the depth was checked against along the span. Sampling the
+        # schedule at the mesh stations instead would draw a bowed spar that
+        # nothing in the study ever used.
+        rear = box["wingbox_pct"] + box["K_in"] / (te[:, 0] - le[:, 0])
 
     hint = dir_hint or f"./{name}/"
     # A named section is the same shape at every station, so its camber and
@@ -371,7 +404,8 @@ SCHED_DEFAULT = ("Source: the study schedule (wing5_mtow.stations_and_schedule);
 
 def box_of(r, case):
     """The wingbox replay() built this wing with, plus where its schedule came from."""
-    box = {k: r[k] for k in ("front_pct", "rear_schedule", "y_c_start_in")}
+    box = {k: r[k] for k in ("front_pct", "rear_schedule", "y_c_start_in",
+                             "spar_max_dev_in")}
     # The straight-spar rule, where the design has one. The schedule is the
     # model's 5-knot sample of it, and the two are not the same line between the
     # knots -- which the spar table has to say out loud, on a design whose whole
@@ -483,9 +517,15 @@ def write_readme(path, arc, case, prov, n_stations, n_x, box=None, box_note=""):
         "  box width and box depth. A VSP bundle is an outer surface and carries none",
         "  of that, and the box is what this wing was sized on, so it ships here.",
         f"  front spar   {box['front_pct']:.4f}c at every station, constant.",
-    ] + _wrap("  rear spar    scheduled in y: "
-              + ", ".join(f"({y:.1f} in, {v:.4f}c)" for y, v in box["rear_schedule"]),
-              15) + [
+    ] + (_wrap(f"  rear spar    rear(y) = p + K/c(y), p = {box['wingbox_pct']:.4f}c, "
+               f"K = {box['K_in']:.2f} in -- a spar at constant x. The rows carry "
+               f"that rule; the model samples it as the schedule below and reads "
+               f"it only at the knots.", 15)
+         if box.get("K_in") else []) + _wrap(
+        ("  rear spar    " if not box.get("K_in") else "               ")
+        + "scheduled in y: "
+        + ", ".join(f"({y:.1f} in, {v:.4f}c)" for y, v in box["rear_schedule"]),
+        15) + [
         "               linear between the knots, held flat outside them.",
     ] + _wrap(f"               {box_note}", 15) + [
         "  depth        measured on the exported contour at the rear spar and",
@@ -496,15 +536,18 @@ def write_readme(path, arc, case, prov, n_stations, n_x, box=None, box_note=""):
         "AFT SPAR -- STRAIGHT",
         f"  rear(y) = p + K/c(y) with p = {case.get('wingbox_pct', float('nan')):.4f} and "
         f"K = {case.get('K_in', float('nan')):.2f} in,",
-        "  which puts the spar at CONSTANT x from root to winglet junction. The",
-        f"  schedule the model carries reproduces that rule to "
-        f"{case.get('x_aft_spread_in', float('nan')):.4f} in AT ITS 5 KNOTS,",
-        "  which is where the box constraints are read. Measured on the EXPORTED MESH",
-        f"  the tabulated spar holds x to "
-        f"{(box or {}).get('x_rear_spread_in', float('nan')):.2f} in instead: the schedule",
-        "  interpolates linearly in y between the knots and the rule does not, so the",
-        f"  spar bows a little between them. Arc{arc}_spar.csv reports both, and gives",
-        "  the spar station by station so the bow can be seen rather than taken on trust.",
+        "  which puts the spar at CONSTANT x from root to winglet junction. The model",
+        f"  carries the rule as a 5-knot schedule and reproduces it to "
+        f"{case.get('x_aft_spread_in', float('nan')):.4f} in at those",
+        "  knots, which are the box-width stations and the only places the schedule is",
+        f"  read. Measured on the EXPORTED MESH, station by station in Arc{arc}_spar.csv,",
+        f"  the spar holds x to "
+        f"{(box or {}).get('x_rear_spread_in', float('nan')):.2f} in. That residual is the "
+        f"BASELINE's, not this design's:",
+        f"  the as-built spar line itself departs from straight by up to "
+        f"{(box or {}).get('spar_max_dev_in', float('nan')):.2f} in,",
+        "  and the parameterization scales that baseline rather than rebuilding it. No",
+        "  design variable in this study can make the exported spar straighter than that.",
         "  K is set by the hardest-binding box-width station, not chosen.",
         "  Consequence worth knowing: constant x is a LARGER chord fraction where the",
         "  chord is smaller, so the spar moves aft in section terms going outboard --",
