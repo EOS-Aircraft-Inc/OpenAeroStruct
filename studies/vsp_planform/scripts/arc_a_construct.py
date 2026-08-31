@@ -70,19 +70,24 @@ M2_FT2 = 10.7639104
 BASE_STATIONS = ((100.0, 65.0), (176.0, 65.0), (356.0, 55.0))
 
 
-def evaluate(taper_B, case, cmt_at, p, schedule, stations):
+def evaluate(taper_B, case, cmt_at, p, schedule, stations, rule="root_le_fixed"):
     """One model evaluation.
 
     The chord is independent of the rear schedule (param.py: ``c_w`` depends on p and
     taper only), so station chords read off a first pass are exact for building the
     straight-spar schedule on a second pass.
+
+    ``rule`` is region A's rule. This construction needs ``root_le_fixed``, which is
+    what both baselines ship as. Arc A's constant-fraction construction needs
+    ``preserved``, so the parameter exists rather than the constant it replaced --
+    see arc_a_constfrac.py, where the rule is the whole difference between the two.
     """
     w2.REAR_SCHEDULE, w2.WIDTH_STATIONS = schedule, stations
     config.WINGBOX_FRONT_PCT = w2.FRONT_PCT
     config.WINGBOX_REAR_SCHEDULE = schedule
     config.WINGBOX_WIDTH_STATIONS = stations
     saved = param.REGION_A_RULE[w2.BASELINE]
-    param.REGION_A_RULE[w2.BASELINE] = "root_le_fixed"
+    param.REGION_A_RULE[w2.BASELINE] = rule
     orig = ro.build_surface
 
     def _surface(mesh_, stick_, regions_, **kw):

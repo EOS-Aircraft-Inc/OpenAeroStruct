@@ -67,6 +67,7 @@ from studies.vsp_planform.coupling.geometry import normalized_sections, section_
 import wing2_oas as w2                                           # noqa: E402
 from wing8_constchord_toc import REGION_A_AS_BUILT_IN            # noqa: E402
 from compare_classes import replay, baseline_case                # noqa: E402
+import lift_distribution as LD                                   # noqa: E402
 from studies.vsp_planform.param import rear_spar_fraction        # noqa: E402
 
 LOGS = Path(os.path.dirname(os.path.dirname(_HERE))) / "out" / "logs"
@@ -78,6 +79,18 @@ ARCS = {                       # region A end, region A rule, design-point sourc
     "A": (REGION_A_AS_BUILT_IN, "root_le_fixed", ("wing8_design_point.json", "constchord_asbuilt")),
     "B": (w2.REGION_A_END_IN, "preserved", ("wing7_design_point.json", "wing7_mtow")),
     "C": (w2.REGION_A_END_IN, "root_le_fixed", ("wing7_design_point.json", "wing3_mtow")),
+}
+# Design points that are BUILT to the constraints rather than searched for, in
+# PREFERENCE ORDER, and used only when they passed their own constraints.
+#
+# Arc A has two constructions. Both put the aft spar at constant x; they differ in
+# whether the spar IS the straight construction line. The constant-fraction one is
+# preferred: same constraint class, same requirements met, and measured lower drag,
+# less area and less wing weight. They are NOT separate architectures -- an arc
+# letter names a constraint class, and a second letter here would name a class that
+# does not exist. See arc_a_constfrac.py.
+CONSTRUCTED = {
+    "A": ("arc_a_constfrac", "arc_a_constructed"),
 }
 GEOM_ID = {"A": "ARCAOASEXP", "B": "ARCBOASEXP", "C": "ARCCOASEXP"}
 
@@ -427,42 +440,57 @@ def box_of(r, case):
 
 
 def load_design(arc):
-    """Replay the arc's design point and return (mesh_m, toc, provenance, box)."""
+    """Replay the arc's design point.
+
+    Returns (mesh_m, toc, section, provenance, case, box, box_note, prob). The
+    problem comes back because the bundle ships the spanwise load as well as the
+    shape, and that load must come from THIS wing rather than from a second build
+    of it -- replay() has already cross-checked it against the logged drag.
+    """
     y_a, rule, (fname, key) = ARCS[arc]
     # Prefer a t/c-optimised design point when one has been produced. The
     # section is part of the file's identity, so it is named here too -- a bundle
     # exported from the wrong section would carry the wrong contours entirely.
     airfoil = os.environ.get("ARC_AIRFOIL", "e694")
     sfx = "" if airfoil in ("", "as-built") else f"_{airfoil}"
-    # Arc A is CONSTRUCTED, not optimized: its straight aft spar is a geometric
+    # A CONSTRUCTED arc is not optimized: its straight aft spar is a geometric
     # requirement, built to rather than searched for. Never export one that failed
     # its own constraints.
-    if arc == "A":
+    for stem in CONSTRUCTED.get(arc, ()):
         for prof in ("optimal", "capped"):
-            pc = LOGS / f"arc_a_constructed_{prof}{sfx}.json"
-            if pc.exists():
-                case = json.loads(pc.read_text())
-                if case.get("feasible"):
-                    r = replay(case, y_a, rule)
-                    return (r["mesh"], r["toc"], case.get("airfoil") or "as-built",
-                            f"{pc.name} ({prof} t/c, CONSTRUCTED straight aft spar)",
-                            case) + box_of(r, case)
+            pc = LOGS / f"{stem}_{prof}{sfx}.json"
+            if not pc.exists():
+                continue
+            case = json.loads(pc.read_text())
+            if not case.get("feasible"):
                 print(f"  NOTE: {pc.name} is not feasible -- not exported")
+                continue
+            what = ("CONSTRUCTED straight aft spar at a constant fraction"
+                    if case.get("constant_aft_fraction")
+                    else "CONSTRUCTED straight aft spar")
+            # The region A rule belongs to the DESIGN, not to the arc letter: Arc A's
+            # two constructions are solved on different rules, and replaying either
+            # on the other's rule reproduces a different wing. replay() cross-checks
+            # the logged drag, so a wrong rule here fails loudly rather than exports.
+            r = replay(case, y_a, case.get("region_a_rule") or rule, want_prob=True)
+            return (r["mesh"], r["toc"], case.get("airfoil") or "as-built",
+                    f"{pc.name} ({prof} t/c, {what})",
+                    case) + box_of(r, case) + (r["prob"],)
     for prof in ("optimal", "capped"):
         p = LOGS / f"arc_optimal_toc_{arc}_{prof}{sfx}.json"
         if p.exists():
             case = json.loads(p.read_text())
-            r = replay(case, y_a, rule)
+            r = replay(case, y_a, rule, want_prob=True)
             # The section the design was BUILT on, taken from the design point
             # rather than the environment, so a bundle cannot be exported on a
             # section the aero was never run with.
             sec = case.get("airfoil") or "as-built"
             return (r["mesh"], r["toc"], sec, f"{p.name} ({sec}, {prof} t/c)",
-                    case) + box_of(r, case)
+                    case) + box_of(r, case) + (r["prob"],)
     case = json.loads((LOGS / fname).read_text())[key]
-    r = replay(case, y_a, rule)
+    r = replay(case, y_a, rule, want_prob=True)
     return (r["mesh"], r["toc"], "as-built", f"{fname}:{key} (as-built t/c)",
-            case) + box_of(r, case)
+            case) + box_of(r, case) + (r["prob"],)
 
 
 ARCH_NOTE = {
@@ -470,6 +498,83 @@ ARCH_NOTE = {
     "B": "straight forward spar (wingbox_pct pinned at 0.12c)",
     "C": "free -- region A re-lofted, straight line unpinned",
 }
+
+
+def _vs_optimized(arc, case):
+    """How this constructed design compares with the drag-optimum of its own class.
+
+    Measured against the optimizer log rather than quoted from one. The number was
+    hardcoded at 0.5%, which was right for the offset-spar construction and wrong
+    for the constant-fraction one -- the two differ by a factor of three.
+    """
+    prof, af = case.get("profile"), case.get("airfoil")
+    sfx = "" if af in (None, "", "as-built") else f"_{af}"
+    p = LOGS / f"arc_optimal_toc_{arc}_{prof}{sfx}.json"
+    if not p.exists() or not case.get("drag_N"):
+        return ""
+    d0 = json.loads(p.read_text()).get("drag_N")
+    if not d0:
+        return ""
+    return (f", and is {100 * (case['drag_N'] / d0 - 1):+.2f}% against the\n"
+            f"  drag-optimal Arc {arc}, which had a kinking aft spar")
+
+
+def _aft_spar_block(arc, case, box, sched):
+    """The AFT SPAR section of the README. Two architectures, two rules.
+
+    Both put the spar at constant x. The difference is whether the spar IS the
+    line the parameterization holds straight (K = 0, a constant chord fraction) or
+    sits a fixed distance aft of it (K > 0, a rising chord fraction). Saying which
+    is the whole point of the section, so it is not written once for both.
+    """
+    k = case.get("K_in") or 0.0
+    p_ = case.get("wingbox_pct", float("nan"))
+    spread = (box or {}).get("x_rear_spread_in", float("nan"))
+    dev = (box or {}).get("spar_max_dev_in", float("nan"))
+    if k:
+        rule = [
+            f"  rear(y) = p + K/c(y) with p = {p_:.4f} and K = {k:.2f} in,",
+            "  which puts the spar at CONSTANT x from root to winglet junction. The model",
+            f"  carries the rule as a 5-knot schedule and reproduces it to "
+            f"{case.get('x_aft_spread_in', float('nan')):.4f} in at those",
+            "  knots, which are the box-width stations and the only places the schedule is",
+            f"  read.",
+        ]
+        why = [
+            "  K is set by the hardest-binding box-width station, not chosen.",
+            "  Consequence worth knowing: constant x is a LARGER chord fraction where the",
+            "  chord is smaller, so the spar moves aft in section terms going outboard --",
+            f"  {sched[0][1]:.3f}c at the root to {sched[-1][1]:.3f}c at the junction. That is"
+            f" why the",
+            "  aileron depth had to be bought back with chord.",
+        ]
+    else:
+        rule = [
+            f"  rear(y) = p = {p_:.5f}c at EVERY station, with K = 0. The aft spar IS the",
+            "  line the parameterization holds straight, so it is at CONSTANT x from root",
+            "  to winglet junction AND at a constant chord fraction. Those two properties",
+            "  coincide only for this one fraction: any other sits at",
+            "  x = x_spar + (f - p)*c(y), which moves with the chord.",
+        ]
+        why = [
+            "  p is set by the hardest-binding box-width station, not chosen, and it is the",
+            "  SMALLEST fraction that clears every one of them -- a larger fraction moves",
+            "  the spar aft for nothing.",
+            "  A constant fraction does NOT require a constant chord. This wing tapers from",
+            f"  its root chord to {(case.get('chord_at_aileron_in') or float('nan')):.2f} in at"
+            f" the aileron, and the leading edge",
+            "  moves aft by exactly p times the chord it loses. The as-built Plan L wing is",
+            "  the same construction at 0.60065c.",
+        ]
+    common = [
+        f"  Measured on the EXPORTED MESH, station by station in Arc{arc}_spar.csv, the",
+        f"  spar holds x to {spread:.2f} in. That residual is the BASELINE's, not this",
+        f"  design's: the as-built spar line itself departs from straight by up to",
+        f"  {dev:.2f} in, and the parameterization scales that baseline rather than",
+        "  rebuilding it. No design variable in this study can make the exported spar",
+        "  straighter than that.",
+    ]
+    return ["AFT SPAR -- STRAIGHT"] + rule + common + why + [""]
 
 
 def _wrap(text, indent, width=76):
@@ -503,6 +608,8 @@ def write_readme(path, arc, case, prov, n_stations, n_x, box=None, box_note=""):
         "CONTENTS",
         f"  Arc{arc}_af.csv                  airfoil metadata, one block per station",
         f"  Arc{arc}_spar.csv                both spars and the box depth, one row per station",
+        f"  Arc{arc}_lift_cruise.csv         spanwise lift at mid-cruise weight, 1 g",
+        f"  Arc{arc}_lift_mtow.csv           spanwise lift at MTOW, 1 g",
         f"  Arc{arc}_<GeomID>_<i>.dat        Selig contour, one per station",
         f"  {n_stations} stations, {n_x} points per contour.",
         "  Contours are normalized by local chord. Selig order: trailing edge along",
@@ -512,10 +619,10 @@ def write_readme(path, arc, case, prov, n_stations, n_x, box=None, box_note=""):
         "HOW THIS DESIGN WAS PRODUCED",
         ("  CONSTRUCTED, not drag-optimized. Its straight aft spar is a geometric\n"
          "  requirement, so the design is built to satisfy the constraints rather than\n"
-         "  searched for: the twist and alpha come from the optimized Arc A and the\n"
-         "  taper is solved on the 7 in aileron depth. Its drag is therefore FEASIBLE,\n"
-         "  not best-in-class, and is about 0.5% above the drag-optimal Arc A that had\n"
-         "  a kinking aft spar. Do not read it as an architecture comparison."
+         "  searched for: the twist and alpha come from the optimized design point and\n"
+         "  the taper is solved on the 7 in aileron depth. Its drag is therefore\n"
+         f"  FEASIBLE, not best-in-class{_vs_optimized(arc, case)}. Do not read it as an\n"
+         "  architecture comparison."
          if constructed else
          "  Drag-optimized within its constraint class (OAS, SLSQP): minimum drag at\n"
          "  MTOW subject to the box-width requirements, trim, and an area floor."),
@@ -543,30 +650,8 @@ def write_readme(path, arc, case, prov, n_stations, n_x, box=None, box_note=""):
         "               multiplied by the chord, so it reproduces the study's own",
         "               depth = retention * t/c * chord from the shipped files.",
         "",
-    ] if box else []) + ([
-        "AFT SPAR -- STRAIGHT",
-        f"  rear(y) = p + K/c(y) with p = {case.get('wingbox_pct', float('nan')):.4f} and "
-        f"K = {case.get('K_in', float('nan')):.2f} in,",
-        "  which puts the spar at CONSTANT x from root to winglet junction. The model",
-        f"  carries the rule as a 5-knot schedule and reproduces it to "
-        f"{case.get('x_aft_spread_in', float('nan')):.4f} in at those",
-        "  knots, which are the box-width stations and the only places the schedule is",
-        f"  read. Measured on the EXPORTED MESH, station by station in Arc{arc}_spar.csv,",
-        f"  the spar holds x to "
-        f"{(box or {}).get('x_rear_spread_in', float('nan')):.2f} in. That residual is the "
-        f"BASELINE's, not this design's:",
-        f"  the as-built spar line itself departs from straight by up to "
-        f"{(box or {}).get('spar_max_dev_in', float('nan')):.2f} in,",
-        "  and the parameterization scales that baseline rather than rebuilding it. No",
-        "  design variable in this study can make the exported spar straighter than that.",
-        "  K is set by the hardest-binding box-width station, not chosen.",
-        "  Consequence worth knowing: constant x is a LARGER chord fraction where the",
-        "  chord is smaller, so the spar moves aft in section terms going outboard --",
-        f"  {sched[0][1]:.3f}c at the root to {sched[-1][1]:.3f}c at the junction. That is"
-        f" why the",
-        "  aileron depth had to be bought back with chord.",
-        "",
-    ] if (constructed and sched) else []) + [
+    ] if box else []) + (
+        _aft_spar_block(arc, case, box, sched) if (constructed and sched) else []) + [
         "SECTION",
     ] + ([
         f"  SPANWISE: {blend['inboard']} inboard, blending to {blend['outboard']} between",
@@ -634,12 +719,27 @@ if __name__ == "__main__":
     GEOMS.mkdir(parents=True, exist_ok=True)
     for arc in arcs:
         name = f"Arc{arc}"
-        mesh, toc, sec, prov, case, box, box_note = load_design(arc)
+        mesh, toc, sec, prov, case, box, box_note, prob = load_design(arc)
         work = GEOMS / name
         csv_path, spar_path, dats = export(mesh, toc, name, GEOM_ID[arc], work,
                                            n_x=a.n_x, airfoil=sec,
                                            blend=case.get("section_blend"),
                                            box=box, box_note=box_note)
+        # The spanwise load, from the wing just exported. A shape without a load is
+        # half a handover: the spar table says where the structure is, and these say
+        # what it carries. 1 g and unfactored, which every file says on its own face.
+        loads = []
+        for tag, w_lb in LD.weights_lb().items():
+            dist = LD.distribution(prob, w_lb)
+            ck = dist["checks"]
+            bad = [k for k in ("rel_vs_CL", "rel_vs_weight", "rel_cl_sectional")
+                   if ck[k] > LD.TOL_REL]
+            if bad:
+                raise RuntimeError(
+                    f"{name} {tag}: {bad} exceed {LD.TOL_REL*100:.1f}% -- the strip "
+                    f"forces do not integrate to the trimmed lift, so no load is shipped.")
+            loads.append(Path(LD.write_csv(work / f"{name}_lift_{tag}.csv",
+                                           dist, name, prov)))
         rd = write_readme(work / f"{name}_README.txt", arc, case, prov,
                           len(dats), a.n_x, box=box, box_note=box_note)
         zpath = GEOMS / f"{name}.zip"
@@ -647,6 +747,8 @@ if __name__ == "__main__":
             zf.write(rd, f"{name}/{rd.name}")
             zf.write(csv_path, f"{name}/{csv_path.name}")
             zf.write(spar_path, f"{name}/{spar_path.name}")
+            for ld in loads:
+                zf.write(ld, f"{name}/{ld.name}")
             for d in dats:
                 zf.write(d, f"{name}/{d.name}")
         print(f"  {name}: {len(dats)} stations, {a.n_x} pts/contour -> {zpath.name} "

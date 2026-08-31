@@ -79,6 +79,10 @@ NACELLES = {176.0: "inboard nacelle", 356.0: "outboard nacelle"}
 Y_JUNCTION_IN = 674.9
 # Aileron actuator depth floor, matching arc_optimal_toc.DEPTH_REQ.
 DEPTH_REQ_IN = 7.0
+# The aileron station the depth floor is written at: 90 percent of the semi-span,
+# matching arc_optimal_toc.Y_AIL. The spanwise-load panels mark it because it is
+# where the stall margin matters most.
+Y_AIL_IN = 0.90 * 708.0
 
 
 def retention_fn(airfoil=None, blend=None):
@@ -176,8 +180,12 @@ PLAN_L_COLOR = "#8C7B6B"
 PLAN_L_AFT_PCT = 0.60065
 
 
-def baseline_case(name="plan_l"):
-    """As-built baseline at MTOW: run, trimmed, never optimized."""
+def baseline_case(name="plan_l", want_prob=False):
+    """As-built baseline at MTOW: run, trimmed, never optimized.
+
+    ``want_prob`` returns the built problem, so the reference can carry a spanwise
+    load in the comparison alongside the three arcs.
+    """
     from studies.vsp_planform.run_opt import load_baseline
     schedule, stations, _ = stations_and_schedule()
     config.WINGBOX_FRONT_PCT = w2.FRONT_PCT
@@ -203,7 +211,8 @@ def baseline_case(name="plan_l"):
                                  [n_st:] / config.SCALE),
             "constraint_width_in": None, "constraint_stations": stations,
             "aft_pct": PLAN_L_AFT_PCT,
-            STRAIGHT_LINE_KEY: float(prob.get_val("wing.wingbox_pct")[0])}
+            STRAIGHT_LINE_KEY: float(prob.get_val("wing.wingbox_pct")[0]),
+            **({"prob": prob} if want_prob else {})}
 
 
 # Arc A / B / C are the architectures; the wing numbers are the runs that
@@ -223,10 +232,23 @@ DEFINITIONS = ("Arc A: constant chord.   Arc B: straight forward spar.   "
 # the front spar, Arc A and Arc C let it optimize near the aft spar, and Plan L's
 # is the least-squares fit to its as-built loft.
 STRAIGHT_LINE_KEY = "wingbox_pct"
+# Constructed design points per arc, in PREFERENCE ORDER. An arc letter names a
+# CONSTRAINT CLASS, so two constructions of the same class share a letter and are
+# told apart by how they were produced. Kept in step with export_dat.CONSTRUCTED.
+CONSTRUCTED = {
+    "A": ("arc_a_constfrac", "arc_a_constructed"),
+}
 
 
-def replay(case, y_a_in, rule):
-    """Rebuild a stored case and confirm it reproduces its logged drag."""
+def replay(case, y_a_in, rule, want_prob=False):
+    """Rebuild a stored case and confirm it reproduces its logged drag.
+
+    ``want_prob`` returns the built OpenMDAO problem alongside the results, for a
+    caller that has to interrogate the model further -- a spanwise load at a
+    different weight, for instance. It is an addition, not a change: the drag
+    cross-check below still runs, so anything built this way is a design point that
+    reproduced itself rather than a fresh guess at one.
+    """
     schedule, stations, _ = stations_and_schedule()
     # A design may carry its own rear-spar schedule -- Arc A's straight aft spar is
     # rear(y) = p + K/c(y), which is neither the shared kink nor a constant -- and its
@@ -332,7 +354,8 @@ def replay(case, y_a_in, rule):
             "y_c_start_in": float(regions.y_c_start),
             # retention belongs to the section, so the depth panel must use this
             "airfoil": case.get("airfoil"),
-            STRAIGHT_LINE_KEY: float(prob.get_val("wing.wingbox_pct")[0])}
+            STRAIGHT_LINE_KEY: float(prob.get_val("wing.wingbox_pct")[0]),
+            **({"prob": prob, "regions": regions} if want_prob else {})}
 
 
 if __name__ == "__main__":
@@ -351,18 +374,26 @@ if __name__ == "__main__":
     suffix = "" if ARC_AIRFOIL in ("", "as-built") else f"_{ARC_AIRFOIL}"
 
     def arc_case(arc, fallback_file, fallback_key):
-        # Arc A is CONSTRUCTED, not optimized: its straight aft spar is a geometric
-        # requirement and the design is built to satisfy it rather than searched for.
-        # Preferred when present and feasible; a design that failed its own
-        # constraints must never silently become the figure.
-        p_con = os.path.join(LOGS, f"arc_a_constructed_{TOC_PROFILE}{suffix}.json")
-        if arc == "A" and os.path.exists(p_con):
+        # A CONSTRUCTED design point is not optimized: its straight aft spar is a
+        # geometric requirement and the design is built to satisfy it rather than
+        # searched for. Preferred when present and feasible; a design that failed its
+        # own constraints must never silently become the figure.
+        #
+        # Arc A has two constructions, in the same preference order export_dat uses --
+        # constant fraction first. Duplicating the order rather than importing it is
+        # deliberate: this script must not import export_dat, which imports this one.
+        for stem in CONSTRUCTED.get(arc, ()):
+            p_con = os.path.join(LOGS, f"{stem}_{TOC_PROFILE}{suffix}.json")
+            if not os.path.exists(p_con):
+                continue
             c = json.load(open(p_con))
             if c.get("feasible"):
+                what = ("CONSTRUCTED straight aft spar at a constant fraction"
+                        if c.get("constant_aft_fraction")
+                        else "CONSTRUCTED straight aft spar")
                 return c, (f"{ARC_AIRFOIL}->{c['section_blend']['outboard']}, "
-                           f"{TOC_PROFILE} t/c, CONSTRUCTED straight aft spar")
-            print(f"  NOTE: {os.path.basename(p_con)} is not feasible -- Arc A falls "
-                  f"back to the optimized kinked-spar design point")
+                           f"{TOC_PROFILE} t/c, {what}")
+            print(f"  NOTE: {os.path.basename(p_con)} is not feasible -- not used")
         p_arc = os.path.join(LOGS, f"arc_optimal_toc_{arc}_{TOC_PROFILE}{suffix}.json")
         if os.path.exists(p_arc):
             c = json.load(open(p_arc))
@@ -379,12 +410,19 @@ if __name__ == "__main__":
     cB, provB = arc_case("B", "wing7_design_point.json", "wing7_mtow")
     cA, provA = arc_case("A", "wing8_design_point.json", "constchord_asbuilt")
     print(f"  Arc C: {provC}\n  Arc B: {provB}\n  Arc A: {provA}")
+    # The region A rule belongs to the DESIGN POINT, not to the arc: Arc A has two
+    # constructions solved on different rules, and replaying one on the other's rule
+    # builds a different wing. It was hardcoded here, which the drag cross-check
+    # inside replay() would have caught -- loudly, but only at run time.
     print("  replaying Arc C (free) ...")
-    r_free = replay(cC, w2.REGION_A_END_IN, "root_le_fixed")
+    r_free = replay(cC, w2.REGION_A_END_IN,
+                    cC.get("region_a_rule") or "root_le_fixed", want_prob=True)
     print("  replaying Arc B (straight front spar) ...")
-    r_fwd = replay(cB, w2.REGION_A_END_IN, "preserved")
+    r_fwd = replay(cB, w2.REGION_A_END_IN,
+                   cB.get("region_a_rule") or "preserved", want_prob=True)
     print("  replaying Arc A (constant chord) ...")
-    r_cc = replay(cA, REGION_A_AS_BUILT_IN, "root_le_fixed")
+    r_cc = replay(cA, REGION_A_AS_BUILT_IN,
+                  cA.get("region_a_rule") or "root_le_fixed", want_prob=True)
     # The sized weight belongs to the DESIGN POINT, not the replay: replay
     # reproduces the aero, WingCalc produced the weight. Carrying it across is what
     # lets the merit function be plotted instead of proxied by a break-even
@@ -403,14 +441,34 @@ if __name__ == "__main__":
         _r["rear_schedule"] = _c.get("rear_schedule")
         _r["section_blend"] = _c.get("section_blend")
         _r["constructed"] = bool(_c.get("constructed"))
+        _r["constant_aft_fraction"] = bool(_c.get("constant_aft_fraction"))
 
     TOC_NOTE = provC
     print("  evaluating Plan L as-built (the reference) ...")
-    r_pl = baseline_case("plan_l")
+    r_pl = baseline_case("plan_l", want_prob=True)
     # Plan L LAST in the list so the three optimized classes keep their order and
     # colours, and the reference reads as a reference.
     res = [r_cc, r_fwd, r_free, r_pl]          # Arc A, Arc B, Arc C, reference
     ref = r_pl["drag_N"]                        # Plan L as-built: every % is against it
+
+    # The spanwise load at the weight the aircraft is FLOWN at. Deferred import:
+    # lift_distribution imports this module, so taking it at the top would be a cycle.
+    # Every case is re-trimmed to the same mid-cruise weight, so the four curves are
+    # compared at equal lift and differ only by planform.
+    import lift_distribution as LD
+    W_CRUISE_LB = LD.mission.cruise_weight_lb()
+    print(f"  spanwise load at mid-cruise {W_CRUISE_LB:.0f} lb ...")
+    for _r, _nm in zip(res, [c[0].replace(chr(10), " ") for c in CLASSES]):
+        _d = LD.distribution(_r["prob"], W_CRUISE_LB)
+        _ck = _d["checks"]
+        _bad = [k for k in ("rel_vs_CL", "rel_vs_weight", "rel_cl_sectional")
+                if _ck[k] > LD.TOL_REL]
+        if _bad:
+            raise RuntimeError(f"{_nm}: spanwise load fails {_bad}")
+        _r["load"] = _d
+        print(f"    {_nm:22s} alpha {_d['alpha_deg']:6.3f} deg  max cl "
+              f"{_d['cl'][_d['y_in'] <= LD.Y_JUNCTION_IN].max():.4f}  centre of lift "
+              f"{_d['y_cp_frac']:.4f} semi-span")
 
     schedule, stations, _ = stations_and_schedule()
 
@@ -429,8 +487,8 @@ if __name__ == "__main__":
     rets = [retention_fn(r.get("airfoil"), r.get("section_blend")) for r in res]
     span = [spanwise(r, sched_of(r), rt) for r, rt in zip(res, rets)]
 
-    fig = plt.figure(figsize=(16.5, 23))
-    gs = fig.add_gridspec(6, 3, height_ratios=[1.0, 1.2, 1.0, 1.0, 1.0, 1.15],
+    fig = plt.figure(figsize=(16.5, 26.6))
+    gs = fig.add_gridspec(7, 3, height_ratios=[1.0, 1.2, 1.0, 1.0, 1.0, 1.15, 1.0],
                           hspace=0.42, wspace=0.30, bottom=0.088)
     names = [c[0] for c in CLASSES]
     # Bar ticks get the short name only -- "Arc A constant chord" and its
@@ -759,19 +817,76 @@ if __name__ == "__main__":
         ax.set_title(f"{nm} wingbox in plan — {held}", fontsize=10)
         ax.legend(fontsize=6.8, loc="upper left"); ax.grid(alpha=0.22)
 
+    # ================= THE SPANWISE LOAD =================
+    # Every other panel is an integral -- drag, area, weight. A spar is sized by the
+    # load ALONG the span, so the row that a structures reviewer reads first is this
+    # one. All four are re-trimmed to the SAME mid-cruise weight, so the curves are
+    # compared at equal lift and differ only by planform.
+    #
+    # Wing rows only. The model carries the winglet IN THE PLANE OF THE WING, so the
+    # rows outboard of the junction are a flattened winglet, not wing, and plotting
+    # them would put a curve on the chart that no wing has.
+    def _wing(r):
+        d = r["load"]
+        k = d["y_in"] <= Y_JUNCTION_IN
+        return d, k
+
+    ax = fig.add_subplot(gs[6, 0])
+    for (nm, c, tag), dash, r in zip(CLASSES, dashes, res):
+        d, k = _wing(r)
+        ax.plot(d["y_in"][k], d["cl"][k], color=c, lw=1.9, dashes=dash, label=nm)
+    for ys_ in (REGION_A_AS_BUILT_IN, Y_AIL_IN):
+        ax.axvline(ys_, color="0.45", ls=":", lw=1.0)
+    ax.set_xlabel("y, in"); ax.set_ylabel("sectional $c_l$")
+    ax.set_title(f"Sectional lift coefficient at {W_CRUISE_LB:,.0f} lb\n"
+                 f"(the local chord normalizes it, not the wing area)", fontsize=10.5)
+    ax.legend(fontsize=7.2); ax.grid(alpha=0.25)
+
+    ax = fig.add_subplot(gs[6, 1])
+    for (nm, c, tag), dash, r in zip(CLASSES, dashes, res):
+        d, k = _wing(r)
+        ax.plot(d["y_in"][k], d["lift_lb_per_in"][k], color=c, lw=1.9, dashes=dash,
+                label=nm)
+    for ys_ in (REGION_A_AS_BUILT_IN, Y_AIL_IN):
+        ax.axvline(ys_, color="0.45", ls=":", lw=1.0)
+    ax.set_xlabel("y, in"); ax.set_ylabel("running load, lb/in")
+    ax.set_title(f"Running load at {W_CRUISE_LB:,.0f} lb, 1 g\n"
+                 f"(no gust and no manoeuvre factor)", fontsize=10.5)
+    ax.legend(fontsize=7.2); ax.grid(alpha=0.25)
+
+    ax = fig.add_subplot(gs[6, 2])
+    for (nm, c, tag), dash, r in zip(CLASSES, dashes, res):
+        d, k = _wing(r)
+        ax.plot(d["y_in"][k], d["lift_N_per_in"][k] / d["elliptical_N_per_in"][k],
+                color=c, lw=1.9, dashes=dash, label=nm)
+    ax.axhline(1.0, color="0.35", lw=1.0)
+    ax.set_xlabel("y, in"); ax.set_ylabel("load / elliptical")
+    ax.set_title("Load against the elliptical reference\n"
+                 "(same total lift on the same semi-span)", fontsize=10.5)
+    ax.legend(fontsize=7.2); ax.grid(alpha=0.25)
+    ax.text(0.02, 0.03,
+            "wing rows only: this model lays the winglet\nin the wing plane",
+            transform=ax.transAxes, fontsize=7.0, color="0.35", va="bottom")
+
     fig.suptitle("Best drag available inside each planform constraint class — full OAS at MTOW 382 547 N, "
                  "span pinned at 118 ft, all trimmed to the same lift\n"
                  f"Arc A / B / C carry the {TOC_NOTE} profile; Plan L is the as-built loft",
                  fontsize=12)
-    _con = [nm for (nm, _c, _t), r in zip(CLASSES, res) if r.get("constructed")]
+    _con = [(nm, r) for (nm, _c, _t), r in zip(CLASSES, res) if r.get("constructed")]
+    _what = ", ".join(
+        f"{nm} CONSTRUCTED to a straight aft spar"
+        + (" at a constant chord fraction" if r.get("constant_aft_fraction") else "")
+        for nm, r in _con)
     _note = DEFINITIONS + (
-        f"    |    {', '.join(_con)} CONSTRUCTED to a straight aft spar, not "
-        f"drag-optimized -- its drag is feasible, not best-in-class." if _con else "")
+        f"    |    {_what}, not drag-optimized -- its drag is feasible, "
+        f"not best-in-class." if _con else "")
     fig.text(0.5, 0.058, _note, ha="center", fontsize=10, fontweight="bold")
     fig.text(0.5, 0.028,
              "All percentages are against PLAN L AS-BUILT. Drag is NOT the merit function: the study ranks on electric range at fixed MTOW (m_batt/D), break-even "
-             f"{BREAK_EVEN_LB_PER_N:.3f} lb of wing per newton,\nso 'may weigh' is how much heavier each architecture can be and still match Plan L on range -- and the bottom row now plots that range directly. "
-             "Wing-only drag throughout. Depth and width use EACH design's own section retention.\nDesign points: Arc A = wing 8, Arc B = wing 7, Arc C = wing 3.",
+             f"{BREAK_EVEN_LB_PER_N:.3f} lb of wing per newton,\nso 'may weigh' is how much heavier each architecture can be and still match Plan L on range -- and the range-against-weight panel plots that directly. "
+             "Wing-only drag throughout. Depth and width use EACH design's own section retention.\n"
+             f"The bottom row is the spanwise load, re-trimmed to mid-cruise {W_CRUISE_LB:,.0f} lb at 1 g -- unfactored, so it is not a limit load.\n"
+             "Design points: Arc A = wing 8, Arc B = wing 7, Arc C = wing 3.",
              ha="center", fontsize=8.5, style="italic")
 
     os.makedirs(FIGS, exist_ok=True)
