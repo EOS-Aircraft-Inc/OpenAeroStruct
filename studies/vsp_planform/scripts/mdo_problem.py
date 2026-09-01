@@ -1,0 +1,357 @@
+"""ONE OpenMDAO problem: drag at two operating points, under the field-length and
+climb-gradient requirements, with CLmax computed from the flap planform.
+
+WHAT IS COUPLED, AND WHAT COULD NOT BE. Three of the four pieces are genuine
+OpenMDAO components and go in whole, with derivatives:
+
+  OpenAeroStruct    the wing, and an AeroPoint at EACH operating point
+  WingCLmaxEstimateGroup   flap span and chord fractions -> flap area -> CLmax
+  TOFL / LFL        Atlas's MetaModelStructuredComp tables
+
+The fifth piece could not. The five climb metrics come from
+run_fixed_point_watlim, which builds and runs its OWN OpenMDAO problem per call and
+returns floats with no partials. Inside an optimizer that is not viable, so they
+enter as a MetaModelStructuredComp trained on the real analysis over
+(S_ref, CLmax) -- watlim_surrogate.py, 45 samples, 12 s. That is the same treatment
+Atlas already gives TOFL and LFL, and the component refuses to extrapolate off the
+trained box rather than guessing past it.
+
+TWO OPERATING POINTS. Drag is evaluated at both, each with its own atmosphere and
+its own trim angle of attack:
+
+  cruise   25,000 ft, 260 KTAS   Mach 0.4319, rho 0.5489
+  low      10,000 ft, 245 KTAS   Mach 0.3838, rho 0.9046
+
+The objective is a WEIGHTED SUM of the two drags, --w-cruise and --w-low, because
+one wing cannot be optimal at both and the split is a programme choice rather than
+a result. Set a weight to zero to optimize one point and merely report the other.
+Both points fly the same mesh and the same thickness distribution; only the
+atmosphere and alpha differ.
+
+WHAT IS HELD. Span at 118 ft, MTOW 86,000 lb, commanded power 1400 kW. The climb
+surrogate is trained at that power and weight and is not valid away from them.
+
+THE APPROXIMATION WORTH KNOWING. WingCLmaxEstimateGroup builds its flap area on a
+SINGLE TRAPEZOID wing, root_chord = 2*S_ref/(span*(1+taper)). These wings are
+three-region planforms with a constant-chord inboard section, so the flap area, and
+therefore CLmax, is an approximation. taper_B is passed as the trapezoid taper.
+"""
+
+import argparse
+import contextlib
+import os
+import sys
+
+import numpy as np
+import openmdao.api as om
+
+_HERE = os.path.abspath(__file__)
+sys.path.insert(0, os.path.dirname(_HERE))
+sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(_HERE), "..", "..", "..")))
+
+from openaerostruct.aerodynamics.aero_groups import AeroPoint          # noqa: E402
+from studies.vsp_planform import config                                # noqa: E402
+from studies.vsp_planform.atmosphere import flight_condition           # noqa: E402
+from studies.vsp_planform.param import (build_geometry_group, build_surface,  # noqa: E402
+                                        mac_quarter_chord)
+import wing2_oas as w2                                                 # noqa: E402
+import arc_optimal_toc as A                                            # noqa: E402
+
+LOGS = os.path.join(os.path.dirname(os.path.dirname(_HERE)), "out", "logs")
+M2_FT2 = 10.7639104
+LB_TO_KG = 0.45359237
+SPAN_FT = 118.0
+
+POINTS = {
+    "cruise": {"ktas": 260.0, "alt_ft": 25000.0},
+    "low":    {"ktas": 245.0, "alt_ft": 10000.0},
+}
+MTOW_LB = 86000.0
+MTOP_KW = 1400.0
+TOFL_LIMIT_FT = 6000.0
+LFL_LIMIT_FT = 6000.0
+
+
+@contextlib.contextmanager
+def _atlas_cwd():
+    import atlas
+    root = os.path.dirname(os.path.dirname(os.path.abspath(atlas.__file__)))
+    prev = os.getcwd()
+    os.chdir(root)
+    try:
+        yield root
+    finally:
+        os.chdir(prev)
+
+
+def _field_length_comps():
+    """TOFL and LFL as MetaModelStructuredComp, fed by OUR CLmax.
+
+    Atlas's TOFLLookupTable wires its own flap-schedule CLmax into the interpolator
+    internally, so the group cannot accept a computed one. The interpolators are
+    rebuilt here from the SAME cached training arrays that Atlas's loader prepares,
+    which reuses all of its grid completion and axis padding and adds no new data.
+    """
+    from atlas.mission.takeoff_landing_lookup import TOFLLookupTable, LFLLookupTable
+    with _atlas_cwd():
+        TOFLLookupTable._load_training_data()
+        LFLLookupTable._load_training_data()
+    T, L = TOFLLookupTable, LFLLookupTable
+
+    tofl = om.MetaModelStructuredComp(vec_size=1, method="slinear", extrapolate=True)
+    tofl.add_input("TOW", MTOW_LB * LB_TO_KG, training_data=T._mtow_kg, units="kg")
+    tofl.add_input("S_ref", 85.0, training_data=T._Sref_m2, units="m**2")
+    tofl.add_input("MTOP", MTOP_KW, training_data=T._mtop_kW, units="kW")
+    tofl.add_input("CLmax", float(T._clmax.max()), training_data=T._clmax)
+    tofl.add_output("TOFL_ft", 4000.0, training_data=T._tofl_matrix, units="ft")
+
+    lfl = om.MetaModelStructuredComp(vec_size=1, method="slinear", extrapolate=True)
+    lfl.add_input("TOW", MTOW_LB * LB_TO_KG, training_data=L._mtow_kg, units="kg")
+    lfl.add_input("S_ref", 85.0, training_data=L._Sref_m2, units="m**2")
+    lfl.add_input("CLmax", float(np.median(L._clmax)), training_data=L._clmax)
+    lfl.add_output("LFL_ft", 4000.0, training_data=L._lfl_matrix, units="ft")
+    # The LFL CLmax axis spans 3.0144 to 3.0164 -- one landing CLmax padded to three
+    # points. It is therefore NOT driven by the computed CLmax, which is a take-off
+    # value in any case; it is pinned at the landing value the table carries.
+    return tofl, lfl, {"tofl_clmax_axis": (float(T._clmax.min()), float(T._clmax.max())),
+                       "lfl_clmax_fixed": float(np.median(L._clmax)),
+                       "sref_axis": (float(T._Sref_m2.min()), float(T._Sref_m2.max()))}
+
+
+def _climb_comp(npz):
+    """The five climb metrics, from the surrogate trained on the real analysis."""
+    d = np.load(npz, allow_pickle=True)
+    c = om.MetaModelStructuredComp(vec_size=1, method="slinear", extrapolate=False)
+    c.add_input("S_ref", 85.0, training_data=d["s_ref_m2"], units="m**2")
+    c.add_input("CLmax", 2.78, training_data=d["clmax25"])
+    labels = [str(x) for x in d["labels"]]
+    targets = [float(v) for v in d["targets"]]
+    names = ["watlim_2nd", "watlim_4th", "landing", "approach", "aeo"]
+    for i, nm in enumerate(names):
+        c.add_output(nm, float(np.nanmean(d[f"phase_{i+1}"])),
+                     training_data=d[f"phase_{i+1}"])
+    meta = {"names": names, "labels": labels, "targets": targets,
+            "sref_axis": (float(d["s_ref_m2"].min()), float(d["s_ref_m2"].max())),
+            "clmax_axis": (float(d["clmax25"].min()), float(d["clmax25"].max())),
+            "power_kw": float(d["power_kw"]), "tow_lbm": float(d["tow_lbm"])}
+    return c, meta
+
+
+def build(case, npz, flap_span=0.70, flap_chord=0.35, flap_angle=25.0):
+    """Assemble the whole thing. ``case`` is a design point dict."""
+    from atlas.aerodynamics.CL_max_est import WingCLmaxEstimateGroup
+
+    y_a = A.REGION_A_AS_BUILT_IN
+    import studies.vsp_planform.param as param
+    saved = param.REGION_A_RULE[w2.BASELINE]
+    param.REGION_A_RULE[w2.BASELINE] = case.get("region_a_rule") or "root_le_fixed"
+    try:
+        mesh, stick, regions, planform0 = w2.load_relofted(w2.BASELINE, y_a)
+        surface = build_surface(mesh, stick, regions)
+    finally:
+        param.REGION_A_RULE[w2.BASELINE] = saved
+
+    prob = om.Problem(reports=False)
+    model = prob.model
+    cg, mac, y_mac = mac_quarter_chord(mesh)
+
+    model.add_subsystem("wing", build_geometry_group(surface, regions, planform0),
+                        promotes_outputs=["sweep_B", "station_chord", "wingbox_width",
+                                          "twist_abs"])
+
+    # ---- one AeroPoint per operating point, each with its own atmosphere and alpha
+    for tag, spec in POINTS.items():
+        fc = flight_condition(spec["ktas"], spec["alt_ft"])
+        ivc = om.IndepVarComp()
+        ivc.add_output("v", val=fc["v"], units="m/s")
+        ivc.add_output("alpha", val=1.0, units="deg")
+        ivc.add_output("Mach_number", val=fc["Mach_number"])
+        ivc.add_output("re", val=fc["re"], units="1/m")
+        ivc.add_output("rho", val=fc["rho"], units="kg/m**3")
+        ivc.add_output("cg", val=cg, units="m")
+        model.add_subsystem(f"vars_{tag}", ivc)
+        model.add_subsystem(f"pt_{tag}", AeroPoint(surfaces=[surface]))
+        for v in ("v", "alpha", "Mach_number", "re", "rho", "cg"):
+            model.connect(f"vars_{tag}.{v}", f"pt_{tag}.{v}")
+        model.connect("wing.mesh", f"pt_{tag}.wing.def_mesh")
+        model.connect("wing.mesh", f"pt_{tag}.aero_states.wing_def_mesh")
+        model.connect("wing.t_over_c", f"pt_{tag}.wing_perf.t_over_c")
+        model.add_subsystem(f"forces_{tag}", om.ExecComp(
+            ["lift = 0.5 * rho * v**2 * S_ref * CL",
+             "drag = 0.5 * rho * v**2 * S_ref * CD"],
+            lift={"units": "N"}, drag={"units": "N"},
+            rho={"units": "kg/m**3", "val": fc["rho"]},
+            v={"units": "m/s", "val": fc["v"]},
+            S_ref={"units": "m**2", "val": 85.0}, CL={"val": 0.9}, CD={"val": 0.03}))
+        model.connect(f"pt_{tag}.wing.S_ref", f"forces_{tag}.S_ref")
+        model.connect(f"pt_{tag}.wing_perf.CL", f"forces_{tag}.CL")
+        model.connect(f"pt_{tag}.wing_perf.CD", f"forces_{tag}.CD")
+
+    # ---- CLmax from the flap planform -------------------------------------
+    semi_m = 0.5 * SPAN_FT * 0.3048
+    fivc = om.IndepVarComp()
+    fivc.add_output("ac|geom|wing|span", SPAN_FT * 0.3048, units="m")
+    fivc.add_output("ac|geom|wing|taper", float(case.get("taper_B", 0.44)))
+    fivc.add_output("ac|geom|wing|y_inbd_flp_inbd", 0.10 * semi_m, units="m")
+    fivc.add_output("ac|geom|wing|y_inbd_flp_outbd", 0.38 * semi_m, units="m")
+    fivc.add_output("ac|geom|wing|y_outbd_flp_inbd", 0.41 * semi_m, units="m")
+    fivc.add_output("ac|geom|wing|outbd_span_ratio", flap_span)
+    fivc.add_output("flap_chord_frac", flap_chord)
+    fivc.add_output("toverc", float(case.get("toc_root", 0.24)) * 100.0)
+    fivc.add_output("flap_angle", flap_angle, units="deg")
+    fivc.add_output("cl_max_clean", 2.05)
+    fivc.add_output("delta_y", 5.1)
+    fivc.add_output("mach", 0.2)
+    fivc.add_output("delta_CLmax_s", 0.0)
+    model.add_subsystem("flap_vars", fivc, promotes=["*"])
+    model.add_subsystem("clmax", WingCLmaxEstimateGroup(), promotes=["*"])
+    model.connect("pt_cruise.wing.S_ref", "ac|geom|wing|S_ref")
+
+    # ---- field length and climb -------------------------------------------
+    tofl, lfl, fmeta = _field_length_comps()
+    model.add_subsystem("tofl", tofl)
+    model.add_subsystem("lfl", lfl)
+    model.connect("pt_cruise.wing.S_ref", ["tofl.S_ref", "lfl.S_ref"])
+    model.connect("CL_max", "tofl.CLmax")
+    climb, cmeta = _climb_comp(npz)
+    model.add_subsystem("climb", climb)
+    model.connect("pt_cruise.wing.S_ref", "climb.S_ref")
+    model.connect("CL_max", "climb.CLmax")
+    return prob, surface, planform0, {"field": fmeta, "climb": cmeta}, mesh
+
+
+def add_optimization(prob, meta, mesh, w_cruise=1.0, w_low=0.0,
+                     weight_n=None, flap_dv=False, width_min_in=None,
+                     drop_aeo=False, pct_dv=False):
+    """Objective, trim, design variables and constraints.
+
+    EACH POINT IS TRIMMED SEPARATELY. alpha is a design variable per point and the
+    lift at that point is an equality constraint, so both operating points carry the
+    same aircraft weight at their own atmosphere. Without this the two drags are
+    read at whatever alpha the model happens to hold, which is not a comparison.
+    """
+    from studies.vsp_planform.param import twist_cp_bounds
+    m = prob.model
+    w_n = float(weight_n if weight_n is not None else w2.W)
+
+    m.add_subsystem("obj", om.ExecComp(
+        "J = wc*dc + wl*dl", J={"units": "N"}, dc={"units": "N"}, dl={"units": "N"},
+        wc={"val": w_cruise}, wl={"val": w_low}), promotes_outputs=["J"])
+    m.connect("forces_cruise.drag", "obj.dc")
+    m.connect("forces_low.drag", "obj.dl")
+    m.add_objective("J", ref=1e4)
+
+    tw_lower, tw_upper = twist_cp_bounds(mesh, config.N_TWIST_CP)
+    m.add_design_var("wing.twist_cp", lower=tw_lower, upper=tw_upper, units="deg")
+    m.add_design_var("wing.taper_B", lower=config.TAPER_B_BOUNDS[0],
+                     upper=config.TAPER_B_BOUNDS[1])
+    if pct_dv:
+        # run_opt.py records why this is off by default: under a rule that pins the
+        # straight line, wingbox_pct is a FIXED quantity and offering it to SLSQP as
+        # a design variable stalls the driver on a degenerate direction.
+        m.add_design_var("wing.wingbox_pct", lower=config.WINGBOX_CHORD_PCT_BOUNDS[0],
+                         upper=config.WINGBOX_CHORD_PCT_BOUNDS[1])
+    for tag in POINTS:
+        m.add_design_var(f"vars_{tag}.alpha", lower=-5.0, upper=12.0, units="deg")
+        m.add_constraint(f"forces_{tag}.lift", equals=w_n, ref=w_n)
+    if flap_dv:
+        # The flap is a real lever on CLmax and therefore on TOFL and the climb
+        # margins. It is off by default because it changes the aircraft, not the wing.
+        m.add_design_var("ac|geom|wing|outbd_span_ratio", lower=0.55, upper=0.80)
+        m.add_design_var("flap_chord_frac", lower=0.25, upper=0.40)
+
+    if width_min_in is not None:
+        m.add_constraint("wingbox_width", lower=np.asarray(width_min_in) * config.SCALE,
+                         units="m", ref=float(np.mean(width_min_in)) * config.SCALE)
+
+    m.add_constraint("tofl.TOFL_ft", upper=TOFL_LIMIT_FT, ref=1e3)
+    m.add_constraint("lfl.LFL_ft", upper=LFL_LIMIT_FT, ref=1e3)
+    # The surrogate REFUSES to extrapolate, so the optimizer has to be told where it
+    # may go. Outside this box the climb outputs are not defined.
+    lo, hi = meta["climb"]["sref_axis"]
+    m.add_constraint("pt_cruise.wing.S_ref", lower=lo, upper=hi, units="m**2", ref=hi)
+    for nm, tgt in zip(meta["climb"]["names"], meta["climb"]["targets"]):
+        if drop_aeo and nm == "aeo":
+            # AEO is not met at ANY area at this power and weight -- 1373 fpm at the
+            # smallest area in the training grid against 1400 required. Leaving it in
+            # makes the problem infeasible by construction and hides every other
+            # result. It is dropped only when asked, and it is still reported.
+            continue
+        m.add_constraint(f"climb.{nm}", lower=tgt, ref=abs(tgt) or 1.0)
+    return prob
+
+
+def report(prob, meta, head=""):
+    """Every quantity the problem constrains, with its margin."""
+    S = float(prob.get_val("pt_cruise.wing.S_ref")[0])
+    if head:
+        print(head)
+    print(f"  S_ref {S:7.3f} m2 = {S*M2_FT2:7.1f} ft2   "
+          f"CL_max {float(prob.get_val('CL_max')[0]):.4f}   "
+          f"S_wf {float(prob.get_val('S_wf', units='m**2')[0]):.2f} m2   "
+          f"taper_B {float(prob.get_val('wing.taper_B')[0]):.4f}")
+    tot = 0.0
+    for tag in POINTS:
+        d = float(prob.get_val(f"forces_{tag}.drag")[0])
+        tot += d
+        print(f"  {tag:6s} alpha {float(prob.get_val(f'vars_{tag}.alpha', units='deg')[0]):6.3f} deg"
+              f"  CL {float(prob.get_val(f'pt_{tag}.wing_perf.CL')[0]):.4f}"
+              f"  lift {float(prob.get_val(f'forces_{tag}.lift')[0]):9.1f} N"
+              f"  drag {d:9.1f} N")
+    for nm, lim, sense in (("tofl.TOFL_ft", TOFL_LIMIT_FT, "<="),
+                           ("lfl.LFL_ft", LFL_LIMIT_FT, "<=")):
+        v = float(prob.get_val(nm)[0])
+        print(f"  {nm.split('.')[1]:10s} {v:9.1f} ft {sense} {lim:.0f}   "
+              f"margin {lim-v:+9.1f}   {'PASS' if v <= lim else 'FAIL'}")
+    for nm, tgt, lab in zip(meta["climb"]["names"], meta["climb"]["targets"],
+                            meta["climb"]["labels"]):
+        v = float(prob.get_val(f"climb.{nm}")[0])
+        print(f"  {lab[:20]:20s} {v:9.2f} >= {tgt:8.2f}   margin {v-tgt:+9.2f}   "
+              f"{'PASS' if v >= tgt else 'FAIL'}")
+    return tot
+
+
+if __name__ == "__main__":
+    import json
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--case", default="arc_a_constfrac_optimal_e694.json")
+    ap.add_argument("--surrogate", default="watlim_surrogate_1400kw_86000lbm.npz")
+    ap.add_argument("--w-cruise", type=float, default=1.0)
+    ap.add_argument("--w-low", type=float, default=0.0)
+    ap.add_argument("--flap-dv", action="store_true", help="let the flap geometry move")
+    ap.add_argument("--drop-aeo", action="store_true",
+                    help="report AEO but do not constrain it")
+    ap.add_argument("--pct-dv", action="store_true", help="let wingbox_pct move")
+    ap.add_argument("--optimize", action="store_true")
+    ap.add_argument("--maxiter", type=int, default=40)
+    a = ap.parse_args()
+
+    case = json.load(open(os.path.join(LOGS, a.case)))
+    npz = os.path.join(LOGS, a.surrogate)
+    prob, surface, planform0, meta, mesh_out = build(case, npz)
+    add_optimization(prob, meta, mesh_out, a.w_cruise, a.w_low,
+                     flap_dv=a.flap_dv, drop_aeo=a.drop_aeo, pct_dv=a.pct_dv)
+    if a.optimize:
+        prob.driver = om.ScipyOptimizeDriver(optimizer="SLSQP", maxiter=a.maxiter,
+                                             tol=1e-6)
+        prob.driver.options["debug_print"] = ["nl_cons", "objs"]
+    prob.setup()
+    prob.set_val("wing.taper_B", case["taper_B"])
+    prob.set_val("wing.wingbox_pct", case["wingbox_pct"])
+    prob.set_val("wing.twist_cp", np.array(case["twist_cp"]), units="deg")
+    if case.get("t_over_c_cp") is not None:
+        prob.set_val("wing.t_over_c_cp", np.array(case["t_over_c_cp"]))
+    prob.run_model()
+
+    print(f"objective weights: cruise {a.w_cruise:.2f}, low {a.w_low:.2f}   "
+          f"trim weight {w2.W:,.0f} N at BOTH points")
+    print(f"climb surrogate: {meta['climb']['power_kw']:.0f} kW, "
+          f"{meta['climb']['tow_lbm']:,.0f} lbm, S_ref "
+          f"{meta['climb']['sref_axis'][0]:.0f}-{meta['climb']['sref_axis'][1]:.0f} m2, "
+          f"CLmax {meta['climb']['clmax_axis'][0]:.2f}-{meta['climb']['clmax_axis'][1]:.2f}")
+    report(prob, meta, f"\nAS BUILT ({a.case}, untrimmed alpha):")
+
+    if a.optimize:
+        prob.run_driver()
+        report(prob, meta, "\nOPTIMIZED:")
+        print(f"  driver success: {prob.driver.result.success}")
