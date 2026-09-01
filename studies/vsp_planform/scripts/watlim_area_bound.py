@@ -1,38 +1,42 @@
-"""The wing area at which the CLIMB GRADIENT requirements are just met.
+"""The wing area at which the fixed-point climb requirements cross, at held power.
 
-WHAT THIS IS, AND WHAT IT IS NOT. field_length_bound.py bounds the wing area with
-take-off and landing DISTANCE, read from interpolation tables. This bounds it with
-the WAT climb GRADIENTS, and there is no table for those -- they come out of the
-Atlas mission simulation, one run per wing. So this is a bisection over runs, not a
-root find on a surface, and it is slow by construction.
+THE ENTRY POINT MATTERS, AND AN EARLIER VERSION OF THIS FILE USED THE WRONG ONE.
+Atlas has two WATLIM paths and they answer different questions:
 
-THE REQUIREMENTS, from run_watlim_only.py:
+  run_watlim_analysis          sweeps altitude and DISA and returns the WORST
+                               corner. At 1400 kW it reports a 2nd segment near
+                               0.3 %, and nothing passes at any wing area.
+  run_fixed_point_watlim       evaluates ONE stated corner -- 2000 ft, DISA +20
+                               for phases 1 to 4, sea-level ISA for the AEO climb
+                               rate. This is the baseline the programme quotes,
+                               and at 1400 kW and MTOW it passes every gradient.
 
-    watlim_2nd   >= 3.0 %      second segment, one engine inoperative
-    watlim_4th   >= 1.7 %      fourth segment
-    approach     >= 2.7 %
-    landing      >= 3.2 %
-    aeo          >= 2.2 %      all engines operating
+This module drives the second. Reproduced against run_emotor_sizing_fixed_point.py
+at TOW 86,000 lbm and 1400 kW: 3.440 / 3.415 / 4.994 / 3.440 % and 1289 ft/min,
+which is that script's own printed output.
 
-held at every altitude and every DISA the mission config sweeps.
+THE REQUIREMENTS, from _phase_requirements in that script:
 
-POWER IS HELD, AT THE AIRCRAFT LEVEL. The nominal 1400 kW, applied through
-``motor.rating`` because that is the field run_watlim_analysis actually reads. See
-_set_power: writing nacelle.electric_mcp or hybrid_mcp changes nothing at all.
+    1  WATLIM 2nd segment   >= 3.0 %       2000 ft, DISA +20
+    2  WATLIM 4th segment   >= 1.7 %       2000 ft, DISA +20
+    3  Landing              >= 3.2 %       2000 ft, DISA +20
+    4  Approach             >= 2.7 %       2000 ft, DISA +20
+    5  AEO climb rate       >= 1400 ft/min sea level, ISA, 190 KIAS
 
-SPAN IS HELD, NOT ASPECT RATIO. This study pins the span at 118 ft, so a change of
-wing area is a change of ASPECT RATIO: AR = span^2 / S_ref. Atlas's own sizing does
-the opposite -- it holds AR and lets the span follow (size_aircraft.py:632) -- so
-passing an area to Atlas without also setting the span would silently change the
-span and answer a different question. ``--hold ar`` selects Atlas's convention if
-that comparison is ever wanted.
+Phase 5 is a RATE, not a gradient, and it is the one that fails at MTOW.
 
-EVERY REQUIREMENT GETS ITS OWN CROSSOVER. Reporting only the worst margin hides the
-answer, because the phases do not even move the same way with area. Measured at
-1400 kW: approach and landing get WORSE as the wing shrinks and each has a genuine
-crossover, AEO gets BETTER as it shrinks and is met everywhere, and the two WATLIM
-segments are not met at any area at all. A single "boundary area" would have been
-one of those five and would have been silent about the other four.
+POWER IS THE COMMANDED POWER, 1400 kW, passed as fixed_power_hp. It is not the
+motor rating: this path commands power directly and bypasses the motor shaft-power
+cap, exactly as the baseline run does.
+
+SPAN IS HELD, NOT ASPECT RATIO, because this study pins the span at 118 ft. Wing
+area therefore moves the aspect ratio. --hold ar gives Atlas's own convention.
+
+HOW THE AREA IS CHANGED. run_fixed_point_watlim reads its aircraft from an Excel
+file and takes S_ref from it, so the override is applied by wrapping that loader
+for the duration of one call. The wing is changed consistently -- S_ref, S_plan,
+S_trap and the three spans -- because S_ref also sets the stall speed and therefore
+the whole WATLIM speed schedule.
 """
 
 import argparse
@@ -40,7 +44,6 @@ import contextlib
 import json
 import os
 import sys
-import time
 
 import numpy as np
 
@@ -52,15 +55,18 @@ LOGS = os.path.join(os.path.dirname(os.path.dirname(_HERE)), "out", "logs")
 M2_FT2 = 10.7639104
 FT_TO_M = 0.3048
 SPAN_FT = 118.0
-MTOP_KW_NOMINAL = 1400.0
+HP_PER_KW = 1.341
 
-REQUIRED_PCT = {"watlim_2nd": 3.0, "watlim_4th": 1.7, "approach": 2.7,
-                "landing": 3.2, "aeo": 2.2}
+BASELINE = dict(altitude_ft=2000.0, disa_degC=20.0, payload_lbm=17100.0,
+                watlim_2nd_flap_deg=25, aeo_speed_kias=190.0,
+                aeo_climb_rate_target_fpm=1400.0, active_turbines=4,
+                gt_cap_level=0.0, gas_turbine_map="ACCE",
+                bypass_motor_shaft_power_limit=True)
 
 
 @contextlib.contextmanager
 def _atlas_cwd():
-    """Atlas reads ac_data.xlsx and its empirical CSVs by paths relative to its root."""
+    """Atlas reads its Excel and CSV inputs by paths relative to its repo root."""
     import atlas
     root = os.path.dirname(os.path.dirname(os.path.abspath(atlas.__file__)))
     prev = os.getcwd()
@@ -71,226 +77,173 @@ def _atlas_cwd():
         os.chdir(prev)
 
 
-def _set_wing(ac_data, s_ref_m2, hold, span_ft=None):
-    """Put this wing into the Atlas aircraft dictionary, consistently.
+def _wing_override(s_ref_m2, hold, span_ft):
+    """Return a function that puts this wing into a freshly loaded aircraft dict.
 
-    S_ref, S_plan and S_trap all move together, and so do the three spans. Setting
-    the area alone leaves Atlas with a wing whose area and span disagree, which it
-    does not check and which quietly changes the answer.
+    All three areas and all three spans move together. Setting S_ref alone leaves
+    the aircraft with an area and a span that disagree, and S_ref drives the stall
+    speed and therefore the whole WATLIM speed schedule, so the disagreement would
+    reach the answer rather than sit unused.
     """
-    # NOT ``span_ft=SPAN_FT`` in the signature. A default argument binds once, at
-    # definition, so the module constant could not be overridden at run time and a
-    # span sweep silently ran every case at 118 ft. Found by a sweep that returned
-    # the same aspect ratio for 100 ft and 130 ft.
-    span_ft = SPAN_FT if span_ft is None else float(span_ft)
-    w = ac_data["ac"]["geom"]["wing"]
-    if hold == "span":
-        span_m = span_ft * FT_TO_M
-        ar = span_m**2 / s_ref_m2
-    else:                                   # Atlas's own convention
-        ar = float(w["AR"]["value"])
-        span_m = float(np.sqrt(s_ref_m2 * ar))
-    for k in ("S_ref", "S_plan", "S_trap"):
-        w[k]["value"] = s_ref_m2
-        w[k]["units"] = "m**2"
-    for k in ("span", "span_plan", "span_trap"):
-        w[k]["value"] = span_m
-        w[k]["units"] = "m"
-    w["AR"]["value"] = ar
-    if "AR_plan" in w and isinstance(w["AR_plan"], dict):
-        w["AR_plan"]["value"] = ar
-    return {"S_ref_m2": s_ref_m2, "span_m": span_m, "AR": ar}
+    def apply(ac_data):
+        w = ac_data["ac"]["geom"]["wing"]
+        s0 = float(w["S_ref"]["value"])
+        b0 = float(w["span"]["value"])
+        if hold == "span":
+            span_m = float(span_ft) * FT_TO_M
+            ar = span_m**2 / s_ref_m2
+        else:
+            ar = float(w["AR"]["value"])
+            span_m = float(np.sqrt(s_ref_m2 * ar))
+        # SCALE, do not assign. The three areas happen to be equal in this aircraft
+        # but the three spans are NOT: span and span_plan are 35.301 m while
+        # span_trap is 33.700 m, the trapezoidal reference. Assigning one value to
+        # all three clobbered span_trap by 1.6 m and moved the second segment from
+        # 3.440 to 3.435 percent. Scaling preserves every ratio and is an exact
+        # identity when the wing is unchanged, which is how this was caught.
+        ks, kb = s_ref_m2 / s0, span_m / b0
+        for k in ("S_ref", "S_plan", "S_trap"):
+            if k in w:
+                w[k]["value"] = float(w[k]["value"]) * ks
+        for k in ("span", "span_plan", "span_trap"):
+            if k in w:
+                w[k]["value"] = float(w[k]["value"]) * kb
+        w["AR"]["value"] = ar
+        if isinstance(w.get("AR_plan"), dict):
+            w["AR_plan"]["value"] = ar
+        return {"S_ref_m2": s_ref_m2, "span_ft": span_m / FT_TO_M, "AR": ar,
+                "span_trap_m": float(w["span_trap"]["value"]) if "span_trap" in w else None}
+    return apply
 
 
-def _set_power(ac_data, aircraft_kw):
-    """Hold the installed power at an AIRCRAFT-level value, in kW.
+@contextlib.contextmanager
+def _patched_loader(module, apply):
+    """Wrap the module's Excel loader so one call sees the overridden wing.
 
-    The knob is ``motor.rating``, not the nacelle MCP. run_watlim_analysis reads
-    ``ac|propulsion|motor|rating`` and derives everything else from it through
-    prepare_pow_ratings (size_aircraft_doe.py). Setting nacelle.electric_mcp or
-    hybrid_mcp instead changes NOTHING -- measured: the gradients were identical
-    from 1400 kW to 2800 kW, which is how this was found.
-
-    A nacelle carries ``em_stks_per_nac * em_per_stk`` motor units, 6 by default, so
-    the aircraft-level power is that many times the motor rating. The default rating
-    of 264.283 kW is therefore about 1586 kW at the aircraft.
+    A wrapper rather than an edit: run_fixed_point_watlim loads the aircraft itself
+    and there is no argument for the wing, so this is the seam. It is restored on
+    the way out, so nothing leaks into the next call.
     """
-    p = ac_data["ac"]["propulsion"]
-    units_per_nac = (float(p["nacelle"]["em_stks_per_nac"]["value"])
-                     * float(p["nacelle"]["em_per_stk"]["value"]))
-    rating = float(aircraft_kw) / units_per_nac
-    ratio = float(p["motor"]["nom_climb_rated_pow_ratio"]["value"])
-    p["motor"]["rating"]["value"] = rating
-    p["motor"]["rating"]["units"] = "kW"
-    p["motor"]["nom_climb_e_pow_per_nac"]["value"] = rating * units_per_nac * ratio
-    p["motor"]["nom_climb_e_pow_per_nac"]["units"] = "kW"
-    p["nacelle"]["electric_mcp"]["value"] = rating * units_per_nac
-    p["nacelle"]["electric_mcp"]["units"] = "kW"
-    return {"aircraft_kw": float(aircraft_kw), "motor_rating_kw": rating,
-            "units_per_nac": units_per_nac}
+    original = module.load_ac_data_from_excel
+    captured = {}
+
+    def loader(*a, **kw):
+        ac = original(*a, **kw)
+        captured.update(apply(ac))
+        return ac
+
+    module.load_ac_data_from_excel = loader
+    try:
+        yield captured
+    finally:
+        module.load_ac_data_from_excel = original
 
 
-def gradients_at(s_ref_m2, mtop_kw, hold="span", payload_lbm=17100.0,
-                 active_turbines=4, tag="watlim_area", span_ft=None):
-    """One Atlas WATLIM run. Returns the five climb gradients in percent."""
-    from atlas.scenarios.runs.full_ac_sizing.size_aircraft import prepare_ac_data_base
-    from atlas.scenarios.runs.full_ac_sizing.size_aircraft_doe import run_watlim_analysis
-    from atlas.scenarios.setup_mission.load_ac_data import load_ac_data_from_excel
-    from atlas.aerodynamics.empirical_cd_scale import load_empirical_cd_scale_factors
-
-    with _atlas_cwd():
-        base = load_ac_data_from_excel(
-            filename="atlas/scenarios/setup_mission/ac_data.xlsx",
-            bat_filename=("atlas/propulsion/empirical_data/"
-                          "MolicelP80X_module210s8p_4grp14_hiOCV_hiIR_xfeed_per_side_260105.xlsx"),
-            cell_sheetname="BOL_cell_fct_CRate", config_sheetname="battery_config")
-        ac = prepare_ac_data_base(base, payload_lbm)
-        geom = _set_wing(ac, s_ref_m2, hold, span_ft)
-        pw = _set_power(ac, mtop_kw)
-        k0, ki = load_empirical_cd_scale_factors(
-            "atlas/aerodynamics/data/empirical_cd_scale_factors.csv")
-        t0 = time.time()
-        res = run_watlim_analysis(
-            ac_data=ac, feeder_mode="full_crossfeed", plot_n2=False, turb_type="ACCE",
-            case_results_dir=None, case_tag=tag, hybrid_all_phases=True,
-            active_turbines=active_turbines, aircraft_go_around_kw=float(mtop_kw),
-            return_motor_power_ratings=True, apply_emp_cd_scale_corr=True,
-            emp_k_cd0=k0, emp_k_cdi=ki,
-            emp_cd_scale_data_csv="atlas/aerodynamics/data/empirical_cd_scale_factors.csv")
-    if not res:
-        return None
-    out = {k: float(res.get(k, float("nan"))) for k in REQUIRED_PCT}
-    out.update(geom); out.update(pw)
-    out["seconds"] = time.time() - t0
-    out["margins"] = {k: out[k] - REQUIRED_PCT[k] for k in REQUIRED_PCT}
-    worst = min(out["margins"], key=out["margins"].get)
-    out["worst_phase"], out["worst_margin_pct"] = worst, out["margins"][worst]
+def evaluate(s_ref_m2, power_kw=1400.0, tow_lbm=86000.0, hold="span",
+             span_ft=SPAN_FT, **over):
+    """One fixed-point run. Returns the five phase metrics and their margins."""
+    from atlas.scenarios.runs.emotor_sizing import run_emotor_sizing_fixed_point as FP
+    kw = dict(BASELINE)
+    kw.update(over)
+    apply = _wing_override(s_ref_m2, hold, span_ft)
+    with _atlas_cwd(), _patched_loader(FP, apply) as geom:
+        res = FP.run_fixed_point_watlim(
+            mode="fixed_power", fixed_power_hp=float(power_kw) * HP_PER_KW,
+            tow_lbm_override=float(tow_lbm), **kw)
+    out = {"S_ref_m2": s_ref_m2, "power_kw": power_kw, "tow_lbm": tow_lbm}
+    out.update(geom)
+    out["phases"] = {}
+    for r in res:
+        out["phases"][int(r.phase_id)] = {
+            "label": r.label, "metric": float(r.metric_value),
+            "target": float(r.target_value), "margin": float(r.margin),
+            "passes": bool(r.passes_requirement), "name": r.metric_name}
     return out
+
+
+PHASE_ORDER = (1, 2, 3, 4, 5)
 
 
 def crossovers(rows):
-    """Per requirement, the area where it crosses its own limit, by linear bracket.
-
-    Returns one entry per requirement. A requirement met everywhere, or met nowhere,
-    says so and reports its best value and the area that produced it -- those two
-    outcomes are the interesting ones and must not be reported as a bound.
-    """
+    """Per phase, the area where the metric crosses its own target."""
     a = np.array([r["S_ref_m2"] for r in rows], dtype=float)
     out = {}
-    for k, need in REQUIRED_PCT.items():
-        v = np.array([r[k] for r in rows], dtype=float)
+    for pid in PHASE_ORDER:
+        v = np.array([r["phases"][pid]["metric"] for r in rows], dtype=float)
+        need = rows[0]["phases"][pid]["target"]
+        lab = rows[0]["phases"][pid]["label"]
         sign = np.sign(v - need)
         idx = [i for i in range(len(a) - 1) if sign[i] != sign[i + 1]]
         best = int(v.argmax())
-        if not idx:
-            out[k] = {"need_pct": need, "crossings_m2": [],
-                      "state": "met at every area tested" if (v >= need).all()
-                               else "NEVER met at any area tested",
-                      "best_pct": float(v[best]), "best_at_m2": float(a[best])}
-            continue
-        xs = [float(a[i] + (need - v[i]) * (a[i + 1] - a[i]) / (v[i + 1] - v[i]))
-              for i in idx]
-        out[k] = {"need_pct": need, "crossings_m2": xs, "state": "crosses",
-                  "best_pct": float(v[best]), "best_at_m2": float(a[best])}
+        base = {"label": lab, "target": need, "best": float(v[best]),
+                "best_at_m2": float(a[best])}
+        if idx:
+            base["state"] = "crosses"
+            base["crossings_m2"] = [
+                float(a[i] + (need - v[i]) * (a[i + 1] - a[i]) / (v[i + 1] - v[i]))
+                for i in idx]
+        else:
+            base["state"] = ("met at every area tested" if (v >= need).all()
+                             else "NEVER met at any area tested")
+            base["crossings_m2"] = []
+        out[pid] = base
     return out
-
-
-def show(r):
-    print(f"  S_ref {r['S_ref_m2']:6.2f} m2 ({r['S_ref_m2']*M2_FT2:6.1f} ft2)  "
-          f"AR {r['AR']:5.2f}  span {r['span_m']/FT_TO_M:5.1f} ft  "
-          f"motor {r['motor_rating_kw']:.1f} kW x{r['units_per_nac']:.0f}   [{r['seconds']:.0f} s]")
-    for k, need in REQUIRED_PCT.items():
-        m = r["margins"][k]
-        print(f"    {k:>11s} {r[k]:6.2f} %  need {need:4.2f}  margin {m:+5.2f}  "
-              f"{'PASS' if m >= 0 else 'FAIL'}")
-    print(f"    worst: {r['worst_phase']} at {r['worst_margin_pct']:+.2f} %")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--mtop-kw", type=float, default=MTOP_KW_NOMINAL)
+    ap.add_argument("--power-kw", type=float, default=1400.0)
+    ap.add_argument("--tow-lbm", type=float, default=86000.0)
     ap.add_argument("--hold", choices=("span", "ar"), default="span")
     ap.add_argument("--span-ft", type=float, default=SPAN_FT)
-    ap.add_argument("--s-ref", type=float, action="append",
-                    help="m2; repeatable. Evaluate these and stop, no bisection.")
-    ap.add_argument("--bisect", nargs=2, type=float, metavar=("LO", "HI"),
-                    help="m2; bisect for the area where the worst margin is zero")
     ap.add_argument("--sweep", nargs=3, type=float, metavar=("LO", "HI", "STEP"),
-                    help="m2; sweep and report a crossover for EACH requirement")
-    ap.add_argument("--tol", type=float, default=0.5, help="bisection tolerance, m2")
-    ap.add_argument("--max-runs", type=int, default=8)
+                    required=True, help="S_ref, m2")
     a = ap.parse_args()
 
-    print(f"WATLIM climb gradients, power held at {a.mtop_kw:.0f} kW, "
-          f"holding {'span at 118 ft (AR follows)' if a.hold=='span' else 'AR (span follows)'}")
-    hist = []
-    if a.s_ref:
-        for s in a.s_ref:
-            r = gradients_at(s, a.mtop_kw, a.hold, span_ft=a.span_ft)
-            if r is None:
-                print(f"  S_ref {s:.2f} m2: run returned nothing")
-                continue
-            hist.append(r); show(r)
-    elif a.bisect:
-        lo, hi = a.bisect
-        r_lo = gradients_at(lo, a.mtop_kw, a.hold, span_ft=a.span_ft); hist.append(r_lo); show(r_lo)
-        r_hi = gradients_at(hi, a.mtop_kw, a.hold, span_ft=a.span_ft); hist.append(r_hi); show(r_hi)
-        if r_lo["worst_margin_pct"] >= 0:
-            print(f"\nBOUND: the requirements are met at {lo:.2f} m2 already; "
-                  f"the boundary is below the range searched.")
-        elif r_hi["worst_margin_pct"] < 0:
-            print(f"\nBOUND: not met even at {hi:.2f} m2. No boundary in range.")
-        else:
-            for _ in range(a.max_runs - 2):
-                if hi - lo <= a.tol:
-                    break
-                mid = 0.5 * (lo + hi)
-                r = gradients_at(mid, a.mtop_kw, a.hold, span_ft=a.span_ft); hist.append(r); show(r)
-                if r["worst_margin_pct"] >= 0:
-                    hi = mid
-                else:
-                    lo = mid
-            print(f"\nBOUND: S_ref >= {hi:.2f} m2 = {hi*M2_FT2:.1f} ft2 "
-                  f"(bracket {lo:.2f} .. {hi:.2f} m2), set by "
-                  f"{hist[-1]['worst_phase']}")
-    elif a.sweep:
-        lo, hi, step = a.sweep
-        for sv in np.arange(lo, hi + 0.5 * step, step):
-            r = gradients_at(float(sv), a.mtop_kw, a.hold, span_ft=a.span_ft)
-            if r is None:
-                continue
-            hist.append(r)
-            print(f"  S_ref {r['S_ref_m2']:6.1f} m2 ({r['S_ref_m2']*M2_FT2:6.0f} ft2) "
-                  f"AR {r['AR']:5.2f} | " +
-                  "  ".join(f"{k} {r[k]:5.2f}{'P' if r['margins'][k] >= 0 else 'F'}"
-                            for k in REQUIRED_PCT))
-        cx = crossovers(hist)
-        print("\nCROSSOVER AREA, PER REQUIREMENT")
-        bound, by = 0.0, None
-        for k, c in cx.items():
-            if c["state"] == "crosses":
-                for x in c["crossings_m2"]:
-                    print(f"  {k:>11s} need {c['need_pct']:4.2f} %  crosses at "
-                          f"{x:7.2f} m2 = {x*M2_FT2:7.1f} ft2")
-                    if x > bound:
-                        bound, by = x, k
-            else:
-                print(f"  {k:>11s} need {c['need_pct']:4.2f} %  {c['state']} "
-                      f"(best {c['best_pct']:.2f} % at {c['best_at_m2']:.0f} m2)")
-        unmet = [k for k, c in cx.items() if c["state"].startswith("NEVER")]
-        if by:
-            print(f"\nBOUND from the requirements that ARE achievable: S_ref >= "
-                  f"{bound:.2f} m2 = {bound*M2_FT2:.1f} ft2, set by {by}")
-        if unmet:
-            print(f"NOT ACHIEVABLE AT ANY AREA at {a.mtop_kw:.0f} kW: {', '.join(unmet)}. "
-                  f"No wing area fixes those; power does.")
-        out_cx = cx
-    else:
-        ap.error("give --s-ref, --sweep or --bisect")
+    print(f"Fixed-point WATLIM: {BASELINE['altitude_ft']:.0f} ft, DISA "
+          f"+{BASELINE['disa_degC']:.0f} C (phases 1-4), sea-level ISA (phase 5)")
+    print(f"commanded power {a.power_kw:.0f} kW, TOW {a.tow_lbm:,.0f} lbm, "
+          f"holding {'span at %.0f ft' % a.span_ft if a.hold=='span' else 'AR'}\n")
 
-    dst = os.path.join(LOGS, f"watlim_area_{int(a.mtop_kw)}kw_{a.hold}.json")
+    rows = []
+    hdr = None
+    for sv in np.arange(a.sweep[0], a.sweep[1] + 0.5 * a.sweep[2], a.sweep[2]):
+        r = evaluate(float(sv), a.power_kw, a.tow_lbm, a.hold, a.span_ft)
+        rows.append(r)
+        if hdr is None:
+            hdr = True
+            print(f"  {'S_ref m2':>8s} {'ft2':>6s} {'AR':>5s} | " +
+                  " ".join(f"{r['phases'][p]['label'][:11]:>13s}" for p in PHASE_ORDER))
+        print(f"  {r['S_ref_m2']:8.1f} {r['S_ref_m2']*M2_FT2:6.0f} {r['AR']:5.2f} | " +
+              " ".join(f"{r['phases'][p]['metric']:9.2f}"
+                       f"{'P' if r['phases'][p]['passes'] else 'F':>4s}"
+                       for p in PHASE_ORDER))
+
+    cx = crossovers(rows)
+    print("\nCROSSOVER AREA, PER PHASE")
+    bound, by = 0.0, None
+    for pid in PHASE_ORDER:
+        c = cx[pid]
+        if c["state"] == "crosses":
+            for x in c["crossings_m2"]:
+                print(f"  {c['label'][:22]:>22s} need {c['target']:8.2f}  crosses at "
+                      f"{x:7.2f} m2 = {x*M2_FT2:7.1f} ft2")
+                if x > bound:
+                    bound, by = x, c["label"]
+        else:
+            print(f"  {c['label'][:22]:>22s} need {c['target']:8.2f}  {c['state']} "
+                  f"(best {c['best']:.2f} at {c['best_at_m2']:.0f} m2)")
+    if by:
+        print(f"\nBOUND: S_ref >= {bound:.2f} m2 = {bound*M2_FT2:.1f} ft2, set by {by}")
+    never = [cx[p]["label"] for p in PHASE_ORDER if cx[p]["state"].startswith("NEVER")]
+    if never:
+        print(f"NOT MET AT ANY AREA at {a.power_kw:.0f} kW and TOW {a.tow_lbm:,.0f} lbm: "
+              f"{', '.join(never)}")
+
     os.makedirs(LOGS, exist_ok=True)
-    json.dump({"mtop_kw": a.mtop_kw, "hold": a.hold, "span_ft": SPAN_FT,
-               "required_pct": REQUIRED_PCT, "runs": hist,
-               "crossovers": locals().get("out_cx")}, open(dst, "w"), indent=2)
+    dst = os.path.join(LOGS, f"watlim_fixedpoint_{int(a.power_kw)}kw_"
+                             f"{int(a.tow_lbm)}lbm_{a.hold}.json")
+    json.dump({"baseline": BASELINE, "power_kw": a.power_kw, "tow_lbm": a.tow_lbm,
+               "hold": a.hold, "span_ft": a.span_ft, "runs": rows,
+               "crossovers": {str(k): v for k, v in cx.items()}}, open(dst, "w"), indent=2)
     print(f"wrote {dst}")
