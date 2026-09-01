@@ -138,56 +138,140 @@ def _climb_comp(npz):
 
 
 class LiveClimbComp(om.ExplicitComponent):
-    """The five climb metrics from the REAL Atlas analysis, every evaluation.
+    """The five climb metrics from the REAL Atlas segment, BUILT ONCE and re-run.
 
-    NO SURROGATE. An earlier version of this file interpolated a 45-point table and
-    called the direct model "not viable" without timing it. Measured, one call is
-    0.91 s, and this component takes only TWO inputs, so a finite-difference
-    gradient costs three calls -- about 2.7 s -- no matter how many design variables
-    the wing carries. Across an 80-iteration run that is roughly four minutes of
-    climb analysis. The surrogate bought nothing worth its approximation.
+    Atlas is built to run a standalone segment repeatedly, and this uses it that
+    way. Two earlier versions of this file did not:
 
-    Partials are finite-differenced because run_fixed_point_watlim returns floats.
-    The step is in m2 and CLmax units and is deliberately coarse: the metrics are
-    smooth in both, and a tight step would only resolve the Newton solver's own
-    convergence tolerance.
+      a surrogate            45 samples, justified by an assertion that the direct
+                             model was too slow. It was never timed.
+      a black-box wrapper    called run_fixed_point_watlim per evaluation, which
+                             reloads the Excel and re-runs setup every time.
+
+    Timed: the whole black-box call is 1.155 s, prepare_analysis inside it is
+    0.008 s, and run_model on the ALREADY BUILT problem is 0.0488 s. Rebuilding cost
+    24x, and all of it was the Excel and setup. The segment is therefore built once
+    in setup() and only re-run in compute().
+
+    The wing and the speed schedule reach it through set_val on IVC outputs that the
+    built problem already exposes -- S_plan, S_trap, span_plan, span_trap, taper and
+    seg|fltcond|Ueas -- so nothing is patched and nothing is suppressed.
+
+    Partials are finite-differenced because the segment returns floats. With two
+    inputs that is three solves, about 0.15 s per gradient.
     """
 
     def initialize(self):
         self.options.declare("power_kw", default=MTOP_KW)
         self.options.declare("tow_lbm", default=MTOW_LB)
-        self.options.declare("hold", default="span")
         self.options.declare("span_ft", default=SPAN_FT)
+        self.options.declare("altitude_ft", default=2000.0)
+        self.options.declare("disa_degC", default=20.0)
+        self.options.declare("aeo_fpm", default=1400.0)
 
     def setup(self):
-        import watlim_area_bound as WA
-        self._WA = WA
+        self._build_once()
         self.add_input("S_ref", val=80.0, units="m**2")
         self.add_input("CLmax", val=2.78)
         self._names = ("watlim_2nd", "watlim_4th", "landing", "approach", "aeo")
-        self._targets, self._labels = {}, {}
         for nm in self._names:
             self.add_output(nm, val=3.0)
         self.declare_partials("*", "S_ref", method="fd", step=0.5)
         self.declare_partials("*", "CLmax", method="fd", step=0.02)
-        self._calls = 0
+        self.n_solves = 0
 
-    def compute(self, inputs, outputs):
-        import watlim_surrogate as WS
+    def _build_once(self):
+        """Build the Atlas segment a single time and keep it."""
         from atlas.scenarios.runs.emotor_sizing import run_emotor_sizing_fixed_point as FP
         o = self.options
-        orig, sched = WS._patched_speed_schedule(FP, float(inputs["CLmax"][0]))
-        FP.build_watlim_speed_schedule_mps = sched
+        cap = {}
+        orig_prep = FP.prepare_analysis
+        orig_sched = FP.build_watlim_speed_schedule_mps
+
+        def spy(*a, **kw):
+            out = orig_prep(*a, **kw)
+            cap["prob"] = out[0]
+            return out
+
+        def sched_spy(mass_kg, s_ref, flap, aeo_speed_kias=190.0):
+            r = orig_sched(mass_kg, s_ref, flap, aeo_speed_kias=aeo_speed_kias)
+            cap["sched0"] = dict(r)
+            cap["s_ref0"] = float(s_ref)
+            return r
+
+        FP.prepare_analysis, FP.build_watlim_speed_schedule_mps = spy, sched_spy
         try:
-            r = self._WA.evaluate(float(inputs["S_ref"][0]), o["power_kw"],
-                                  o["tow_lbm"], o["hold"], o["span_ft"])
+            with _atlas_cwd():
+                FP.run_fixed_point_watlim(
+                    altitude_ft=o["altitude_ft"], disa_degC=o["disa_degC"],
+                    mode="fixed_power", fixed_power_hp=o["power_kw"] * 1.341,
+                    tow_lbm_override=o["tow_lbm"],
+                    bypass_motor_shaft_power_limit=True,
+                    aeo_climb_rate_target_fpm=o["aeo_fpm"])
         finally:
-            FP.build_watlim_speed_schedule_mps = orig
-        self._calls += 1
-        for i, nm in enumerate(self._names):
-            outputs[nm] = r["phases"][i + 1]["metric"]
-            self._targets[nm] = r["phases"][i + 1]["target"]
-            self._labels[nm] = r["phases"][i + 1]["label"]
+            FP.prepare_analysis = orig_prep
+            FP.build_watlim_speed_schedule_mps = orig_sched
+        self._FP = FP
+        self._prob = cap["prob"]
+        self._sched0 = cap["sched0"]
+        self._s_ref0 = cap["s_ref0"]
+        self._reqs = FP._phase_requirements(o["aeo_fpm"])
+        self._w = self._prob.model.get_val("ac|geom|wing|S_plan", units="m**2")
+        self._wing0 = {k: float(self._prob.get_val(f"ac|geom|wing|{k}",
+                                                   units=("m**2" if k.startswith("S") else "m"))[0])
+                       for k in ("S_plan", "S_trap", "span_plan", "span_trap")}
+        self._phase_ids = None
+
+    def compute(self, inputs, outputs):
+        o = self.options
+        s_ref = float(inputs["S_ref"][0])
+        clmax = float(inputs["CLmax"][0])
+        p = self._prob
+
+        # The wing: scale every area and every span, as watlim_area_bound does, so
+        # span_trap keeps its own value rather than being set equal to span.
+        span_m = o["span_ft"] * 0.3048
+        ks = s_ref / self._wing0["S_plan"]
+        kb = span_m / self._wing0["span_plan"]
+        for k in ("S_plan", "S_trap"):
+            p.set_val(f"ac|geom|wing|{k}", self._wing0[k] * ks, units="m**2")
+        for k in ("span_plan", "span_trap"):
+            p.set_val(f"ac|geom|wing|{k}", self._wing0[k] * kb, units="m")
+
+        # The speed schedule follows S_ref and CLmax, so it is recomputed and set.
+        mass_kg = o["tow_lbm"] / 2.20462
+        k = clmax / 2.7836
+        vs = lambda cl: self._FP._stall_speed_mps(cl * k, mass_kg, s_ref)
+        sched = {"v_watlim_2nd_mps": 1.13 * vs(2.7836),
+                 "v_watlim_4th_mps": 1.18 * vs(1.4651),
+                 "v_approach_mps": 1.13 * vs(2.7836),
+                 "v_ldg_mps": 1.23 * vs(2.9591),
+                 "v_aeo_mps": 190.0 * 0.514}
+        sw = self._FP.build_fixed_point_sweep(
+            o["altitude_ft"], o["disa_degC"],
+            np.asarray([o["power_kw"] * 1.341]), 25, sched)
+        p.set_val("seg|fltcond|Ueas", np.asarray(sw["speed_sweep_vals"]).ravel(),
+                  units="m/s")
+        self._phase_ids = np.asarray(sw["phase_id_vals"])
+
+        # The cwd is needed at COMPUTE time, not only at build time: some Atlas
+        # components read their empirical CSVs lazily on the first solve, by a path
+        # relative to the repo root (motor_empirical_mm.py, for one).
+        with _atlas_cwd():
+            p.run_model()
+        self.n_solves += 1
+
+        v_s = p.get_val("seg.fltcond|vs", units="m/s").flatten()
+        utrue = p.get_val("seg.fltcond|Utrue", units="m/s").flatten()
+        alt = p.get_val("seg.fltcond|h", units="ft").flatten()
+        disa = p.get_val("seg.fltcond|TempIncrement", units="degC").flatten()
+        grad = np.tan(np.arcsin(np.clip(v_s / utrue, -1.0, 1.0))) * 100.0
+        roc = v_s * 60.0 / 0.3048
+        res = self._FP._phase_metrics_at_power(
+            self._phase_ids, alt, disa, grad, roc,
+            o["altitude_ft"], o["disa_degC"], self._reqs)
+        for r, nm in zip(res, self._names):
+            outputs[nm] = (r.metric_value if r.metric_value is not None else -1e3)
 
 
 def build(case, npz, flap_span=0.70, flap_chord=0.35, flap_angle=25.0, live_climb=False):
