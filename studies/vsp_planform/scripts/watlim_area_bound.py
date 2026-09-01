@@ -71,13 +71,18 @@ def _atlas_cwd():
         os.chdir(prev)
 
 
-def _set_wing(ac_data, s_ref_m2, hold, span_ft=SPAN_FT):
+def _set_wing(ac_data, s_ref_m2, hold, span_ft=None):
     """Put this wing into the Atlas aircraft dictionary, consistently.
 
     S_ref, S_plan and S_trap all move together, and so do the three spans. Setting
     the area alone leaves Atlas with a wing whose area and span disagree, which it
     does not check and which quietly changes the answer.
     """
+    # NOT ``span_ft=SPAN_FT`` in the signature. A default argument binds once, at
+    # definition, so the module constant could not be overridden at run time and a
+    # span sweep silently ran every case at 118 ft. Found by a sweep that returned
+    # the same aspect ratio for 100 ft and 130 ft.
+    span_ft = SPAN_FT if span_ft is None else float(span_ft)
     w = ac_data["ac"]["geom"]["wing"]
     if hold == "span":
         span_m = span_ft * FT_TO_M
@@ -126,7 +131,7 @@ def _set_power(ac_data, aircraft_kw):
 
 
 def gradients_at(s_ref_m2, mtop_kw, hold="span", payload_lbm=17100.0,
-                 active_turbines=4, tag="watlim_area"):
+                 active_turbines=4, tag="watlim_area", span_ft=None):
     """One Atlas WATLIM run. Returns the five climb gradients in percent."""
     from atlas.scenarios.runs.full_ac_sizing.size_aircraft import prepare_ac_data_base
     from atlas.scenarios.runs.full_ac_sizing.size_aircraft_doe import run_watlim_analysis
@@ -140,7 +145,7 @@ def gradients_at(s_ref_m2, mtop_kw, hold="span", payload_lbm=17100.0,
                           "MolicelP80X_module210s8p_4grp14_hiOCV_hiIR_xfeed_per_side_260105.xlsx"),
             cell_sheetname="BOL_cell_fct_CRate", config_sheetname="battery_config")
         ac = prepare_ac_data_base(base, payload_lbm)
-        geom = _set_wing(ac, s_ref_m2, hold)
+        geom = _set_wing(ac, s_ref_m2, hold, span_ft)
         pw = _set_power(ac, mtop_kw)
         k0, ki = load_empirical_cd_scale_factors(
             "atlas/aerodynamics/data/empirical_cd_scale_factors.csv")
@@ -205,6 +210,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--mtop-kw", type=float, default=MTOP_KW_NOMINAL)
     ap.add_argument("--hold", choices=("span", "ar"), default="span")
+    ap.add_argument("--span-ft", type=float, default=SPAN_FT)
     ap.add_argument("--s-ref", type=float, action="append",
                     help="m2; repeatable. Evaluate these and stop, no bisection.")
     ap.add_argument("--bisect", nargs=2, type=float, metavar=("LO", "HI"),
@@ -220,15 +226,15 @@ if __name__ == "__main__":
     hist = []
     if a.s_ref:
         for s in a.s_ref:
-            r = gradients_at(s, a.mtop_kw, a.hold)
+            r = gradients_at(s, a.mtop_kw, a.hold, span_ft=a.span_ft)
             if r is None:
                 print(f"  S_ref {s:.2f} m2: run returned nothing")
                 continue
             hist.append(r); show(r)
     elif a.bisect:
         lo, hi = a.bisect
-        r_lo = gradients_at(lo, a.mtop_kw, a.hold); hist.append(r_lo); show(r_lo)
-        r_hi = gradients_at(hi, a.mtop_kw, a.hold); hist.append(r_hi); show(r_hi)
+        r_lo = gradients_at(lo, a.mtop_kw, a.hold, span_ft=a.span_ft); hist.append(r_lo); show(r_lo)
+        r_hi = gradients_at(hi, a.mtop_kw, a.hold, span_ft=a.span_ft); hist.append(r_hi); show(r_hi)
         if r_lo["worst_margin_pct"] >= 0:
             print(f"\nBOUND: the requirements are met at {lo:.2f} m2 already; "
                   f"the boundary is below the range searched.")
@@ -239,7 +245,7 @@ if __name__ == "__main__":
                 if hi - lo <= a.tol:
                     break
                 mid = 0.5 * (lo + hi)
-                r = gradients_at(mid, a.mtop_kw, a.hold); hist.append(r); show(r)
+                r = gradients_at(mid, a.mtop_kw, a.hold, span_ft=a.span_ft); hist.append(r); show(r)
                 if r["worst_margin_pct"] >= 0:
                     hi = mid
                 else:
@@ -250,7 +256,7 @@ if __name__ == "__main__":
     elif a.sweep:
         lo, hi, step = a.sweep
         for sv in np.arange(lo, hi + 0.5 * step, step):
-            r = gradients_at(float(sv), a.mtop_kw, a.hold)
+            r = gradients_at(float(sv), a.mtop_kw, a.hold, span_ft=a.span_ft)
             if r is None:
                 continue
             hist.append(r)
