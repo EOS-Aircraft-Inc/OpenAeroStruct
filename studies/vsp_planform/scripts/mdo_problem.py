@@ -137,7 +137,60 @@ def _climb_comp(npz):
     return c, meta
 
 
-def build(case, npz, flap_span=0.70, flap_chord=0.35, flap_angle=25.0):
+class LiveClimbComp(om.ExplicitComponent):
+    """The five climb metrics from the REAL Atlas analysis, every evaluation.
+
+    NO SURROGATE. An earlier version of this file interpolated a 45-point table and
+    called the direct model "not viable" without timing it. Measured, one call is
+    0.91 s, and this component takes only TWO inputs, so a finite-difference
+    gradient costs three calls -- about 2.7 s -- no matter how many design variables
+    the wing carries. Across an 80-iteration run that is roughly four minutes of
+    climb analysis. The surrogate bought nothing worth its approximation.
+
+    Partials are finite-differenced because run_fixed_point_watlim returns floats.
+    The step is in m2 and CLmax units and is deliberately coarse: the metrics are
+    smooth in both, and a tight step would only resolve the Newton solver's own
+    convergence tolerance.
+    """
+
+    def initialize(self):
+        self.options.declare("power_kw", default=MTOP_KW)
+        self.options.declare("tow_lbm", default=MTOW_LB)
+        self.options.declare("hold", default="span")
+        self.options.declare("span_ft", default=SPAN_FT)
+
+    def setup(self):
+        import watlim_area_bound as WA
+        self._WA = WA
+        self.add_input("S_ref", val=80.0, units="m**2")
+        self.add_input("CLmax", val=2.78)
+        self._names = ("watlim_2nd", "watlim_4th", "landing", "approach", "aeo")
+        self._targets, self._labels = {}, {}
+        for nm in self._names:
+            self.add_output(nm, val=3.0)
+        self.declare_partials("*", "S_ref", method="fd", step=0.5)
+        self.declare_partials("*", "CLmax", method="fd", step=0.02)
+        self._calls = 0
+
+    def compute(self, inputs, outputs):
+        import watlim_surrogate as WS
+        from atlas.scenarios.runs.emotor_sizing import run_emotor_sizing_fixed_point as FP
+        o = self.options
+        orig, sched = WS._patched_speed_schedule(FP, float(inputs["CLmax"][0]))
+        FP.build_watlim_speed_schedule_mps = sched
+        try:
+            r = self._WA.evaluate(float(inputs["S_ref"][0]), o["power_kw"],
+                                  o["tow_lbm"], o["hold"], o["span_ft"])
+        finally:
+            FP.build_watlim_speed_schedule_mps = orig
+        self._calls += 1
+        for i, nm in enumerate(self._names):
+            outputs[nm] = r["phases"][i + 1]["metric"]
+            self._targets[nm] = r["phases"][i + 1]["target"]
+            self._labels[nm] = r["phases"][i + 1]["label"]
+
+
+def build(case, npz, flap_span=0.70, flap_chord=0.35, flap_angle=25.0, live_climb=False):
     """Assemble the whole thing. ``case`` is a design point dict."""
     from atlas.aerodynamics.CL_max_est import WingCLmaxEstimateGroup
 
@@ -228,8 +281,21 @@ def build(case, npz, flap_span=0.70, flap_chord=0.35, flap_angle=25.0):
     model.add_subsystem("lfl", lfl)
     model.connect("pt_cruise.wing.S_ref", ["tofl.S_ref", "lfl.S_ref"])
     model.connect("CL_max", "tofl.CLmax")
-    climb, cmeta = _climb_comp(npz)
-    model.add_subsystem("climb", climb)
+    if live_climb:
+        climb = LiveClimbComp()
+        model.add_subsystem("climb", climb)
+        # The real analysis has no trained box, so no S_ref bound is imposed by it.
+        cmeta = {"names": list(climb._names) if hasattr(climb, "_names")
+                 else ["watlim_2nd", "watlim_4th", "landing", "approach", "aeo"],
+                 "labels": ["WATLIM 2nd Segment", "WATLIM 4th Segment", "Landing",
+                            "Approach", "AEO"],
+                 "targets": [3.0, 1.7, 3.2, 2.7, 1400.0],
+                 "sref_axis": (40.0, 140.0), "clmax_axis": (2.0, 3.4),
+                 "power_kw": MTOP_KW, "tow_lbm": MTOW_LB, "live": True}
+    else:
+        climb, cmeta = _climb_comp(npz)
+        model.add_subsystem("climb", climb)
+        cmeta["live"] = False
     model.connect("pt_cruise.wing.S_ref", "climb.S_ref")
     model.connect("CL_max", "climb.CLmax")
     return prob, surface, planform0, {"field": fmeta, "climb": cmeta}, mesh
@@ -369,13 +435,15 @@ if __name__ == "__main__":
     ap.add_argument("--drop-aeo", action="store_true",
                     help="report AEO but do not constrain it")
     ap.add_argument("--pct-dv", action="store_true", help="let wingbox_pct move")
+    ap.add_argument("--live-climb", action="store_true",
+                    help="run the REAL Atlas climb analysis every evaluation")
     ap.add_argument("--optimize", action="store_true")
     ap.add_argument("--maxiter", type=int, default=40)
     a = ap.parse_args()
 
     case = json.load(open(os.path.join(LOGS, a.case)))
     npz = os.path.join(LOGS, a.surrogate)
-    prob, surface, planform0, meta, mesh_out = build(case, npz)
+    prob, surface, planform0, meta, mesh_out = build(case, npz, live_climb=a.live_climb)
     add_optimization(prob, meta, mesh_out, a.w_cruise, a.w_low,
                      flap_dv=a.flap_dv, drop_aeo=a.drop_aeo, pct_dv=a.pct_dv)
     if a.optimize:
@@ -393,7 +461,8 @@ if __name__ == "__main__":
 
     print(f"objective weights: cruise {a.w_cruise:.2f}, low {a.w_low:.2f}   "
           f"trim weight {w2.W:,.0f} N at BOTH points")
-    print(f"climb surrogate: {meta['climb']['power_kw']:.0f} kW, "
+    print(f"climb model: {'LIVE Atlas analysis every evaluation' if meta['climb'].get('live') else 'surrogate'}")
+    print(f"climb setting: {meta['climb']['power_kw']:.0f} kW, "
           f"{meta['climb']['tow_lbm']:,.0f} lbm, S_ref "
           f"{meta['climb']['sref_axis'][0]:.0f}-{meta['climb']['sref_axis'][1]:.0f} m2, "
           f"CLmax {meta['climb']['clmax_axis'][0]:.2f}-{meta['climb']['clmax_axis'][1]:.2f}")
