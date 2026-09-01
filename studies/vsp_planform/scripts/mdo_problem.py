@@ -148,6 +148,21 @@ def build(case, npz, flap_span=0.70, flap_chord=0.35, flap_angle=25.0):
     try:
         mesh, stick, regions, planform0 = w2.load_relofted(w2.BASELINE, y_a)
         surface = build_surface(mesh, stick, regions)
+        # THE SECTION BLEND MUST TRAVEL WITH THE DESIGN. A design point built on a
+        # spanwise section carries a per-panel c_max_t, and c_max_t sets the Raymer
+        # form factor. Building the surface without it gives the wing the AS-BUILT
+        # section's form factor instead: measured here as 11112.6 N against Arc A's
+        # own 10836.4 N, a 276 N error, and compare_classes.replay records the same
+        # failure as 252 N on Arc C. Every drag number in this problem depends on it.
+        blend = case.get("section_blend")
+        if blend:
+            _, cmt_at, _ = A.blended_section(blend["inboard"], blend["outboard"],
+                                             blend["f_start"], blend["f_end"])
+            ym = np.abs(np.asarray(mesh)[0, :, 1]) / config.SCALE
+            yp = 0.5 * (ym[:-1] + ym[1:])
+            surface["c_max_t"] = np.array([cmt_at(v) for v in yp])
+        elif case.get("c_max_t") is not None:
+            surface["c_max_t"] = float(case["c_max_t"])
     finally:
         param.REGION_A_RULE[w2.BASELINE] = saved
 
@@ -281,6 +296,38 @@ def add_optimization(prob, meta, mesh, w_cruise=1.0, w_low=0.0,
     return prob
 
 
+def pretrim(prob, weight_n=None, tol=1e-8, max_iter=25):
+    """Put each point on its lift equality BEFORE the driver starts.
+
+    SLSQP starts from alpha = 1 deg at both points, where the low point carries 560
+    kN against a 383 kN target. Handing it that costs iterations on a constraint a
+    secant solves in seconds, and a 25-iteration run ended worse than the design
+    point it started from. Each point is trimmed independently, because they differ
+    only in atmosphere and each must carry the same weight.
+    """
+    w_n = float(weight_n if weight_n is not None else w2.W)
+    for tag in POINTS:
+        a0 = float(prob.get_val(f"vars_{tag}.alpha", units="deg")[0])
+
+        def lift_at(al):
+            prob.set_val(f"vars_{tag}.alpha", al, units="deg")
+            prob.run_model()
+            return float(prob.get_val(f"forces_{tag}.lift")[0]) - w_n
+
+        f0 = lift_at(a0)
+        a1 = a0 + 1.0
+        f1 = lift_at(a1)
+        for _ in range(max_iter):
+            if abs(f1) < tol * w_n or abs(f1 - f0) < 1e-12:
+                break
+            a2 = a1 - f1 * (a1 - a0) / (f1 - f0)
+            a0, f0 = a1, f1
+            a1 = float(np.clip(a2, -5.0, 12.0))
+            f1 = lift_at(a1)
+        print(f"  pre-trimmed {tag:6s} alpha {a1:7.4f} deg, lift residual {f1:+.2f} N")
+    return prob
+
+
 def report(prob, meta, head=""):
     """Every quantity the problem constrains, with its margin."""
     S = float(prob.get_val("pt_cruise.wing.S_ref")[0])
@@ -342,6 +389,7 @@ if __name__ == "__main__":
     if case.get("t_over_c_cp") is not None:
         prob.set_val("wing.t_over_c_cp", np.array(case["t_over_c_cp"]))
     prob.run_model()
+    pretrim(prob)
 
     print(f"objective weights: cruise {a.w_cruise:.2f}, low {a.w_low:.2f}   "
           f"trim weight {w2.W:,.0f} N at BOTH points")
@@ -349,7 +397,7 @@ if __name__ == "__main__":
           f"{meta['climb']['tow_lbm']:,.0f} lbm, S_ref "
           f"{meta['climb']['sref_axis'][0]:.0f}-{meta['climb']['sref_axis'][1]:.0f} m2, "
           f"CLmax {meta['climb']['clmax_axis'][0]:.2f}-{meta['climb']['clmax_axis'][1]:.2f}")
-    report(prob, meta, f"\nAS BUILT ({a.case}, untrimmed alpha):")
+    report(prob, meta, f"\nAS BUILT ({a.case}, both points trimmed):")
 
     if a.optimize:
         prob.run_driver()
