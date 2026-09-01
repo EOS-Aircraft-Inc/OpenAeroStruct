@@ -27,8 +27,12 @@ passing an area to Atlas without also setting the span would silently change the
 span and answer a different question. ``--hold ar`` selects Atlas's convention if
 that comparison is ever wanted.
 
-WHICH GRADIENT BINDS IS AN OUTPUT. The bisection drives the WORST margin against
-its own requirement, so the binding phase is reported rather than assumed.
+EVERY REQUIREMENT GETS ITS OWN CROSSOVER. Reporting only the worst margin hides the
+answer, because the phases do not even move the same way with area. Measured at
+1400 kW: approach and landing get WORSE as the wing shrinks and each has a genuine
+crossover, AEO gets BETTER as it shrinks and is met everywhere, and the two WATLIM
+segments are not met at any area at all. A single "boundary area" would have been
+one of those five and would have been silent about the other four.
 """
 
 import argparse
@@ -159,6 +163,33 @@ def gradients_at(s_ref_m2, mtop_kw, hold="span", payload_lbm=17100.0,
     return out
 
 
+def crossovers(rows):
+    """Per requirement, the area where it crosses its own limit, by linear bracket.
+
+    Returns one entry per requirement. A requirement met everywhere, or met nowhere,
+    says so and reports its best value and the area that produced it -- those two
+    outcomes are the interesting ones and must not be reported as a bound.
+    """
+    a = np.array([r["S_ref_m2"] for r in rows], dtype=float)
+    out = {}
+    for k, need in REQUIRED_PCT.items():
+        v = np.array([r[k] for r in rows], dtype=float)
+        sign = np.sign(v - need)
+        idx = [i for i in range(len(a) - 1) if sign[i] != sign[i + 1]]
+        best = int(v.argmax())
+        if not idx:
+            out[k] = {"need_pct": need, "crossings_m2": [],
+                      "state": "met at every area tested" if (v >= need).all()
+                               else "NEVER met at any area tested",
+                      "best_pct": float(v[best]), "best_at_m2": float(a[best])}
+            continue
+        xs = [float(a[i] + (need - v[i]) * (a[i + 1] - a[i]) / (v[i + 1] - v[i]))
+              for i in idx]
+        out[k] = {"need_pct": need, "crossings_m2": xs, "state": "crosses",
+                  "best_pct": float(v[best]), "best_at_m2": float(a[best])}
+    return out
+
+
 def show(r):
     print(f"  S_ref {r['S_ref_m2']:6.2f} m2 ({r['S_ref_m2']*M2_FT2:6.1f} ft2)  "
           f"AR {r['AR']:5.2f}  span {r['span_m']/FT_TO_M:5.1f} ft  "
@@ -178,6 +209,8 @@ if __name__ == "__main__":
                     help="m2; repeatable. Evaluate these and stop, no bisection.")
     ap.add_argument("--bisect", nargs=2, type=float, metavar=("LO", "HI"),
                     help="m2; bisect for the area where the worst margin is zero")
+    ap.add_argument("--sweep", nargs=3, type=float, metavar=("LO", "HI", "STEP"),
+                    help="m2; sweep and report a crossover for EACH requirement")
     ap.add_argument("--tol", type=float, default=0.5, help="bisection tolerance, m2")
     ap.add_argument("--max-runs", type=int, default=8)
     a = ap.parse_args()
@@ -214,11 +247,44 @@ if __name__ == "__main__":
             print(f"\nBOUND: S_ref >= {hi:.2f} m2 = {hi*M2_FT2:.1f} ft2 "
                   f"(bracket {lo:.2f} .. {hi:.2f} m2), set by "
                   f"{hist[-1]['worst_phase']}")
+    elif a.sweep:
+        lo, hi, step = a.sweep
+        for sv in np.arange(lo, hi + 0.5 * step, step):
+            r = gradients_at(float(sv), a.mtop_kw, a.hold)
+            if r is None:
+                continue
+            hist.append(r)
+            print(f"  S_ref {r['S_ref_m2']:6.1f} m2 ({r['S_ref_m2']*M2_FT2:6.0f} ft2) "
+                  f"AR {r['AR']:5.2f} | " +
+                  "  ".join(f"{k} {r[k]:5.2f}{'P' if r['margins'][k] >= 0 else 'F'}"
+                            for k in REQUIRED_PCT))
+        cx = crossovers(hist)
+        print("\nCROSSOVER AREA, PER REQUIREMENT")
+        bound, by = 0.0, None
+        for k, c in cx.items():
+            if c["state"] == "crosses":
+                for x in c["crossings_m2"]:
+                    print(f"  {k:>11s} need {c['need_pct']:4.2f} %  crosses at "
+                          f"{x:7.2f} m2 = {x*M2_FT2:7.1f} ft2")
+                    if x > bound:
+                        bound, by = x, k
+            else:
+                print(f"  {k:>11s} need {c['need_pct']:4.2f} %  {c['state']} "
+                      f"(best {c['best_pct']:.2f} % at {c['best_at_m2']:.0f} m2)")
+        unmet = [k for k, c in cx.items() if c["state"].startswith("NEVER")]
+        if by:
+            print(f"\nBOUND from the requirements that ARE achievable: S_ref >= "
+                  f"{bound:.2f} m2 = {bound*M2_FT2:.1f} ft2, set by {by}")
+        if unmet:
+            print(f"NOT ACHIEVABLE AT ANY AREA at {a.mtop_kw:.0f} kW: {', '.join(unmet)}. "
+                  f"No wing area fixes those; power does.")
+        out_cx = cx
     else:
-        ap.error("give --s-ref or --bisect")
+        ap.error("give --s-ref, --sweep or --bisect")
 
     dst = os.path.join(LOGS, f"watlim_area_{int(a.mtop_kw)}kw_{a.hold}.json")
     os.makedirs(LOGS, exist_ok=True)
     json.dump({"mtop_kw": a.mtop_kw, "hold": a.hold, "span_ft": SPAN_FT,
-               "required_pct": REQUIRED_PCT, "runs": hist}, open(dst, "w"), indent=2)
+               "required_pct": REQUIRED_PCT, "runs": hist,
+               "crossovers": locals().get("out_cx")}, open(dst, "w"), indent=2)
     print(f"wrote {dst}")
