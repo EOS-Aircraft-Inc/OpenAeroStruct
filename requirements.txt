@@ -1,0 +1,30 @@
+# Runtime dependencies for this OpenAeroStruct fork and the studies/ work.
+#
+# Install into a clean environment, then install this fork itself in editable
+# mode -- the studies import BOTH `openaerostruct` and `studies.vsp_planform`,
+# so the repo root has to be on the path:
+#
+#     conda create -y -n oas python=3.11
+#     conda activate oas
+#     pip install -r requirements.txt
+#     pip install -e .            # this fork, from the repo root
+#
+# Verify:
+#     python -c "import openaerostruct, studies.vsp_planform.param; print('ok')"
+#     python -m pytest tests/vsp_planform_tests/ -q
+
+# --- core, mirrors setup.py install_requires -------------------------------
+numpy>=1.21
+scipy>=1.7
+matplotlib
+openmdao>=3.35,!=3.40
+
+# --- airfoil DOE (studies/vsp_planform/airfoil_doe.py, scripts/doe_v*.py) ---
+# Pure Python, bundles NeuralFoil. No XFoil binary and no OpenVSP needed --
+# the DegenGeom CSV parser (degen_csv.py) replaces VSP entirely.
+aerosandbox
+pandas
+
+# --- tests -----------------------------------------------------------------
+pytest
+testflo
