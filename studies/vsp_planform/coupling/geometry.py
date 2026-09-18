@@ -65,13 +65,24 @@ def write_dat(path, x_grid, upper, lower, header):
             fh.write(f"{x:.10f} {y:.10f}\n")
 
 
-def export(mesh_m, toc_panel, plate, stick, out_dir, name="OAS_export", max_ws_in=None, n_x=201):
+def export(mesh_m, toc_panel, plate, stick, out_dir, name="OAS_export", max_ws_in=None, n_x=201,
+           front_pct=None, rear_schedule=None):
     """Write ``out_dir/<name>.csv`` and one ``.dat`` per station.
 
     mesh_m     : OAS mesh, (nx, ny, 3), metres
     toc_panel  : t/c per spanwise *panel* from OAS (len ny-1) or per node (len ny)
     plate/stick: baseline DegenGeom, for section shape
     max_ws_in  : drop stations beyond this ws (the winglet junction)
+    front_pct  : box front edge, fraction of chord. With ``rear_schedule``,
+                 also writes ``<name>_spar.csv``.
+    rear_schedule : ``((y_in, x/c), ...)`` breakpoints for the rear spar.
+
+    THE SPAR FILE IS NOT OPTIONAL ON A V3.6 DECK. Those decks carry no
+    'Aft spar chord ratio' row in planformIn.csv, so WingCalc resolves the
+    box from ``OpenVSP/*_spar.csv`` first and falls back to
+    ``AlternativeInputs/sparRatios.csv``. The shipped fallback is a DIFFERENT
+    construction (Arc A's offset spar, 0.750c rising to 0.8044c), so a deck
+    exported without a spar file is silently sized on the wrong box.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     le = mesh_m[0] / SCALE      # (ny, 3) inches
@@ -129,4 +140,48 @@ def export(mesh_m, toc_panel, plate, stick, out_dir, name="OAS_export", max_ws_i
             fh.write(f"Trailing Edge Point, {tep[0]:.6f}, {tep[1]:.6f}, {tep[2]:.6f}\n")
             fh.write(f"Chord, {c:.6f}\n")
             fh.write("#" * 40 + "\n\n")
-    return csv_path, len(blocks)
+    spar_path = None
+    if front_pct is not None and rear_schedule is not None:
+        spar_path = _write_spar(out_dir / f"{name}_spar.csv", name,
+                                [b[1] for b in blocks], ws, chord,
+                                float(front_pct), rear_schedule)
+    return csv_path, len(blocks), spar_path
+
+
+def _write_spar(path, name, idxs, ws, chord, front_pct, rear_schedule):
+    """Write the ``*_spar.csv`` companion WingCalc reads for the box.
+
+    Only ``y_in``, ``front_pct`` and ``rear_pct`` are read back
+    (``io/openvsp.py:find_openvsp_spar_ratios``); the rest is provenance for a
+    human. The tool then requires, in ``io/inputs.py:_validate_spar_ratios``:
+    strictly increasing y, ``0 < fwd < aft < 1``, and -- because both spars are
+    frozen straight inside the fuselage -- every row inboard of W2F BL carrying
+    the value interpolated AT W2F. ``rear_spar_fraction`` holds its end values
+    flat outside the breakpoints, so an inboard-most breakpoint at or outboard of
+    W2F satisfies the last rule by construction.
+    """
+    from studies.vsp_planform.param import rear_spar_fraction
+
+    y = np.asarray(ws, dtype=float)[idxs]
+    c = np.asarray(chord, dtype=float)[idxs]
+    rear = np.asarray(rear_spar_fraction(y, rear_schedule), dtype=float)
+
+    bad = np.flatnonzero(~((0.0 < front_pct) & (front_pct < rear) & (rear < 1.0)))
+    if bad.size:
+        raise ValueError(
+            f"{path.name}: front {front_pct} and rear {rear[bad[0]]} at y "
+            f"{y[bad[0]]:.2f} in do not satisfy 0 < fwd < aft < 1, which WingCalc "
+            f"rejects. Check the rear-spar schedule.")
+
+    with path.open("w", encoding="utf-8") as fh:
+        say = lambda t: print(t, file=fh)
+        say(f"# {name} -- wingbox spar chord fractions, one row per exported station.")
+        say("# Written by studies/vsp_planform/coupling/geometry.py from the OAS design")
+        say("# that was optimized, so the box sized here is the box OAS was constrained on.")
+        sched = tuple((float(a), float(b)) for a, b in rear_schedule)
+        say(f"# Front spar held at {front_pct:.4f}c. Rear spar schedule (y_in, x/c): {sched}")
+        say("# box_width_in is (rear_pct - front_pct) * chord_in; provenance only, not read back.")
+        say("y_in,chord_in,front_pct,rear_pct,box_width_in")
+        for yi, ci, ri in zip(y, c, rear):
+            say(f"{yi:.4f},{ci:.6f},{front_pct:.4f},{ri:.4f},{(ri - front_pct) * ci:.4f}")
+    return path

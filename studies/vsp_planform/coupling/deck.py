@@ -27,6 +27,7 @@ maxima, margins still -0.165). The reference deck allows 6-100 and closes.
 import csv
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -34,7 +35,13 @@ from pathlib import Path
 from studies.vsp_planform.coupling import geometry as wg
 
 # The tool and the reference deck live with the tool, not in a scratch directory.
-WC_ROOT = Path.home() / "repos" / "Structures-WingCalc_Tool"
+# WINGCALC_ROOT overrides it, which is how the Python and Rust checkouts are A/B'd
+# without editing the study. The default is the rust-kernel tool: its bay evaluator
+# is a native extension (``wingcalc_kernel``), and optimization/_rust_bridge.py
+# RAISES rather than falling back when it is missing, so a wrong root fails loudly.
+WC_ROOT = Path(os.environ.get(
+    "WINGCALC_ROOT",
+    Path.home() / "Documents" / "Structures-WingCalc_Tool-rust"))
 
 # V3.5.3_ref was a locally-built deck and is not in the repository; a fresh clone
 # has V3.5.1-V3.5.4. V3.5.3 is the substitute because the PLY BOUNDS are what
@@ -48,10 +55,17 @@ WC_ROOT = Path.home() / "repos" / "Structures-WingCalc_Tool"
 # nowhere to put the access cut-out" and the run dies outboard. V3.5.4 uses
 # Stg 8, an interior stringer, and it is also the deck the study's independent
 # cross-check was run against. Ply bounds are identical (6-100).
-_DECK_CANDIDATES = ("V3.5.3_ref", "V3.5.4", "V3.5.3")
-WC_DECK = next((WC_ROOT / "Inputs" / d for d in _DECK_CANDIDATES
-                if (WC_ROOT / "Inputs" / d).is_dir()),
-               WC_ROOT / "Inputs" / _DECK_CANDIDATES[0])
+# V3.6.x decks are PER ARCHITECTURE -- V3.6.1 Arc A, V3.6.2 Arc B, V3.6.3 Arc C --
+# and differ in planformIn.csv and AlternativeInputs/sparRatios.csv. All three carry
+# the 6-100 ply bounds the inboard bays need, so the V3.5.x hunt for a deck that
+# closes is over; what matters now is picking the one for the arc being run.
+# WINGCALC_DECK names it explicitly.
+_DECK_CANDIDATES = ("V3.6.1", "V3.6.2", "V3.6.3", "V3.5.4")
+_DECK_ENV = os.environ.get("WINGCALC_DECK")
+WC_DECK = ((WC_ROOT / "Inputs" / _DECK_ENV) if _DECK_ENV else
+           next((WC_ROOT / "Inputs" / d for d in _DECK_CANDIDATES
+                 if (WC_ROOT / "Inputs" / d).is_dir()),
+                WC_ROOT / "Inputs" / _DECK_CANDIDATES[0]))
 
 FRONT_PCT = 0.12
 AFT_PCT_SCALAR = 0.750
@@ -109,9 +123,20 @@ def write_deck(src, dst, mtow_lb, w_wing_lb, oas=None):
         vsp = dst / "OpenVSP"
         if vsp.exists():
             shutil.rmtree(vsp)
-        _csv, n = wg.export(oas["mesh"], oas["toc"], oas["plate"], oas["stick"],
-                            vsp, name="OAS_" + BASELINE, max_ws_in=oas["y_junction"])
+        # The spar file goes with the surface. Without it a V3.6 deck falls back to
+        # AlternativeInputs/sparRatios.csv, which describes a different box (Arc A
+        # ships the OFFSET construction there, 0.750c rising to 0.8044c) -- so the
+        # wing would be sized on a box the OAS run never saw.
+        from studies.vsp_planform import config as _cfg
+        _csv, n, spar = wg.export(
+            oas["mesh"], oas["toc"], oas["plate"], oas["stick"],
+            vsp, name="OAS_" + BASELINE, max_ws_in=oas["y_junction"],
+            front_pct=_cfg.WINGBOX_FRONT_PCT,
+            rear_schedule=_cfg.WINGBOX_REAR_SCHEDULE)
         print(f"  geometry: {n} stations exported to {vsp.name}/", flush=True)
+        print(f"  spar:     {spar.name}, front {_cfg.WINGBOX_FRONT_PCT:.4f}c, "
+              f"rear schedule {tuple((float(a), float(b)) for a, b in _cfg.WINGBOX_REAR_SCHEDULE)}",
+              flush=True)
 
     # Last, because it reads the geometry just written: the access cut-out has to
     # land on a stringer that exists in every bay of THIS planform.
@@ -247,6 +272,30 @@ def _wingcalc():
     return mod
 
 
+def _link_dir(link, target):
+    """Point ``link`` at directory ``target``, without needing elevation.
+
+    A real symlink is the first choice, but os.symlink needs SeCreateSymbolicLink,
+    which a normal Windows account does not hold unless Developer Mode is on -- it
+    fails with WinError 1314. A directory JUNCTION does the same job for an
+    absolute local path and needs no privilege, which is why the alias found here
+    was one. mklink is a cmd builtin, so it has to run through the shell.
+    """
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 1314:
+            raise
+    r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.lexists(link):
+        raise OSError(
+            f"could not link {link} -> {target}: symlink needs elevation (WinError "
+            f"1314) and mklink /J returned {r.returncode}: "
+            f"{(r.stderr or r.stdout).strip()}")
+
+
 def _alias_dir_for_workers():
     """Make ``WingCalc_Tool`` importable by NAME, for the sizer's spawn workers.
 
@@ -266,10 +315,45 @@ def _alias_dir_for_workers():
     alias = Path(tempfile.gettempdir()) / "wingcalc_pkg_alias"
     alias.mkdir(parents=True, exist_ok=True)
     link = alias / "WingCalc_Tool"
-    if link.is_symlink() and link.resolve() != WC_ROOT.resolve():
-        link.unlink()
-    if not link.exists():
-        link.symlink_to(WC_ROOT, target_is_directory=True)
+
+    # The alias OUTLIVES the run and is shared by every checkout, so a link left by a
+    # previous session points at whichever tool ran last. Two ways that went wrong:
+    # a dangling link (old ~/repos path) survives `exists()` and makes symlink_to
+    # raise FileExistsError, and a link to a DIFFERENT but real checkout is worse --
+    # the workers then silently import the other tool. Both are fixed by clearing
+    # anything that is not already the wanted target, whatever kind of thing it is.
+    want = WC_ROOT.resolve()
+
+    # DETECTION HAS TO BE lexists + readlink, not is_symlink/exists. A Windows
+    # directory JUNCTION -- which is what a previous session left here, aimed at a
+    # Structures-WingCalc_Tool-v0.46.0 checkout that no longer exists -- reports
+    # is_symlink() False, islink() False AND exists() False, while still occupying
+    # the name. Every guard phrased on those three walks straight past it and
+    # symlink_to then fails with WinError 183.
+    current = None
+    if os.path.lexists(link):
+        try:
+            current = Path(os.readlink(link).replace("\\?\\", "")).resolve()
+        except OSError:
+            current = None
+    if current != want:
+        if os.path.lexists(link):
+            for remove in (os.rmdir, os.unlink):   # junction/dir-symlink, then file
+                try:
+                    remove(link)
+                    break
+                except OSError:
+                    continue
+            else:
+                shutil.rmtree(link, ignore_errors=True)
+        _link_dir(link, WC_ROOT)
+
+    # Verify, because importing the WRONG tool is the failure this whole shim exists
+    # to prevent and it is invisible in the results.
+    if link.resolve() != want:
+        raise RuntimeError(
+            f"the worker alias {link} resolves to {link.resolve()}, not {want}. The "
+            f"spawn workers would import the wrong WingCalc checkout.")
     return alias
 
 
@@ -284,9 +368,22 @@ def run_wingcalc(deck, outdir):
     existing = os.environ.get("PYTHONPATH", "")
     if alias not in existing.split(os.pathsep):
         os.environ["PYTHONPATH"] = (alias + os.pathsep + existing) if existing else alias
+    # PYTHONPATH ALONE IS NOT ENOUGH, and the failure is silent. A "spawn" child does
+    # not build its sys.path from PYTHONPATH: multiprocessing.spawn.get_preparation_data
+    # ships the PARENT's sys.path and prepare() assigns it verbatim. This parent binds
+    # WingCalc_Tool through importlib, so the alias never reaches sys.path, and every
+    # worker dies in `pickle.load` with ModuleNotFoundError inside a pool that keeps
+    # restarting it -- the run looks like a hang, not an error. Putting the alias on
+    # sys.path here is what actually reaches the workers; PYTHONPATH is kept for any
+    # child that is launched as a fresh interpreter instead.
+    if alias not in sys.path:
+        sys.path.insert(0, alias)
     _wingcalc()
-    from WingCalc_Tool.main import optimize_bay
-    optimize_bay(deck, outdir)
+    # Renamed from ``optimize_bay`` in the rust-kernel branch. ``staggered`` is left
+    # at its new default (True), which overlaps bays across workers; the tool notes
+    # staggered=False is the reference path for comparing against older runs.
+    from WingCalc_Tool.main import optimize
+    optimize(deck, outdir)
     for row in csv.reader((outdir / "04.Weights" / "wingWeightSummary.csv").open()):
         if row and row[0] == "W_wing":
             return float([x for x in row[1:] if x.strip()][-1])
