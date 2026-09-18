@@ -55,12 +55,16 @@ WC_ROOT = Path(os.environ.get(
 # nowhere to put the access cut-out" and the run dies outboard. V3.5.4 uses
 # Stg 8, an interior stringer, and it is also the deck the study's independent
 # cross-check was run against. Ply bounds are identical (6-100).
-# V3.6.x decks are PER ARCHITECTURE -- V3.6.1 Arc A, V3.6.2 Arc B, V3.6.3 Arc C --
-# and differ in planformIn.csv and AlternativeInputs/sparRatios.csv. All three carry
-# the 6-100 ply bounds the inboard bays need, so the V3.5.x hunt for a deck that
-# closes is over; what matters now is picking the one for the arc being run.
-# WINGCALC_DECK names it explicitly.
-_DECK_CANDIDATES = ("V3.6.1", "V3.6.2", "V3.6.3", "V3.5.4")
+# ONE deck. The per-architecture decks (V3.6.1/2/3 = Arc A/B/C) were redundant: they
+# were byte-identical outside OpenVSP/ apart from a single line, "Cut-out alternative
+# STG location" (Stg 8 / 2 / 7) -- and resolve_cutout() below already computes that
+# line per planform and rewrites it, so the only thing the arc decks encoded was
+# something this module derives anyway. V3.5.4 and V3.6.1 were byte-identical outside
+# OpenVSP/ entirely.
+#
+# The deck is a BASELINE plus whatever OAS exports into OpenVSP/; the arc identity
+# lives in the export, not in the deck. WINGCALC_DECK overrides the name.
+_DECK_CANDIDATES = ("Baseline",)
 _DECK_ENV = os.environ.get("WINGCALC_DECK")
 WC_DECK = ((WC_ROOT / "Inputs" / _DECK_ENV) if _DECK_ENV else
            next((WC_ROOT / "Inputs" / d for d in _DECK_CANDIDATES
