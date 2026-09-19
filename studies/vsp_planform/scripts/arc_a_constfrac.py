@@ -207,6 +207,10 @@ if __name__ == "__main__":
     ap.add_argument("--airfoil", default="e694")
     ap.add_argument("--tol-depth", type=float, default=0.02, help="depth tolerance, in")
     ap.add_argument("--tol-width", type=float, default=0.03, help="width tolerance, in")
+    ap.add_argument("--seed", default=None,
+                    help="the arc_optimal_toc design point to seed twist/alpha/taper "
+                         "from. Default: out/logs/arc_optimal_toc_A_<profile>[_<airfoil>]"
+                         ".json, generated on the spot if it is not there.")
     a = ap.parse_args()
 
     cp_toc = A.PROFILES[a.profile]
@@ -214,7 +218,24 @@ if __name__ == "__main__":
     n_in, n_out, f0, f1 = A.SECTION_BLEND["A"]
     ret_at, cmt_at, _ = A.blended_section(n_in, n_out, f0, f1)
 
-    src = os.path.join(LOGS, f"arc_optimal_toc_A_{a.profile}_{a.airfoil}.json")
+    # The seed supplies twist, alpha and the taper this construction starts from.
+    # arc_optimal_toc writes NO airfoil suffix for "as-built", so the two names have
+    # to be built the same way or an as-built run looks for a file that cannot exist.
+    suffix = "" if a.airfoil == "as-built" else f"_{a.airfoil}"
+    src = a.seed or os.path.join(LOGS, f"arc_optimal_toc_A_{a.profile}{suffix}.json")
+    if not os.path.exists(src):
+        if a.seed is not None:
+            raise SystemExit(f"--seed {src} does not exist.")
+        print(f"no seed at {os.path.basename(src)} -- generating it first "
+              f"(arc_optimal_toc A/{a.profile}/{a.airfoil}, a few minutes)", flush=True)
+        A.RET, A.C_MAX_T = A.section(a.airfoil)
+        _res = A.solve("A", a.profile)
+        _res["airfoil"], _res["c_max_t"] = a.airfoil, A.C_MAX_T
+        os.makedirs(LOGS, exist_ok=True)
+        with open(src, "w") as _f:
+            json.dump({k: (v.tolist() if hasattr(v, "tolist") else v)
+                       for k, v in _res.items() if not k.startswith("_")}, _f, indent=2)
+        print(f"  wrote the seed to {src}", flush=True)
     case = json.load(open(src))
     case["_cp0"], case["_cpr"] = cp_toc
     p_bounds = tuple(float(v) for v in config.WINGBOX_CHORD_PCT_BOUNDS)

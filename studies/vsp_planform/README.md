@@ -147,6 +147,88 @@ python -m pytest tests/vsp_planform_tests/ -q     # 73 tests
 The DOE needs `pip install aerosandbox` (pure Python, bundles NeuralFoil; no
 XFoil binary). Nothing else needs OpenVSP — the CSV parser replaces it.
 
+### Running an arc, coupled to WingCalc
+
+Everything below assumes the `oas` environment. The base conda environment has
+`openaerostruct` importable but no numpy/scipy/openmdao, which fails somewhere
+unhelpful rather than at the import. **`conda activate oas` does not work on this
+machine** — conda is not on PATH and there is no PowerShell profile hook — so the
+interpreter is named by its full path.
+
+PowerShell, which is what this is run from:
+
+```powershell
+cd C:\Users\SimonRacine\Documents\OpenAeroStruct
+
+C:\Users\SimonRacine\miniforge3\envs\oas\python.exe -u studies\vsp_planform\scripts\arc_optimal_toc.py --arc A --profile optimal --airfoil e694
+C:\Users\SimonRacine\miniforge3\envs\oas\python.exe -u studies\vsp_planform\scripts\arc_optimal_toc.py --arc B --profile optimal --airfoil e694
+C:\Users\SimonRacine\miniforge3\envs\oas\python.exe -u studies\vsp_planform\scripts\arc_optimal_toc.py --arc C --profile optimal --airfoil e694
+
+# Arc A's shipped design point -- constructed, not drag-optimized. Generates its
+# own seed if out/logs/arc_optimal_toc_A_optimal_e694.json is not there.
+C:\Users\SimonRacine\miniforge3\envs\oas\python.exe -u studies\vsp_planform\scripts\arc_a_constfrac.py --profile optimal --airfoil e694
+```
+
+To shorten it with a variable, PowerShell needs the **call operator** `&`. Without
+it the line is parsed as a string and nothing runs — which is exactly how this
+first went wrong:
+
+```powershell
+$OAS = "C:\Users\SimonRacine\miniforge3\envs\oas\python.exe"
+& $OAS -u studies\vsp_planform\scripts\arc_optimal_toc.py --arc A --profile optimal --airfoil e694
+```
+
+Once per machine, the native bay evaluator, built for **this** interpreter: the
+checked-in wheel is `cp314` and the `oas` env is 3.11, so it will not load as
+shipped. `pip` gets the wheel from `Get-ChildItem` because PowerShell does not
+expand `*` in a native executable's arguments.
+
+```powershell
+cd C:\Users\SimonRacine\Documents\Structures-WingCalc_Tool\rust\wingcalc_kernel
+& $OAS -m maturin build --release --interpreter $OAS
+& $OAS -m pip install --force-reinstall --no-deps (Get-ChildItem target\wheels\wingcalc_kernel-*.whl | Select-Object -Last 1).FullName
+```
+
+`WINGCALC_ROOT` defaults to `~/Documents/Structures-WingCalc_Tool` and
+`WINGCALC_DECK` to `Baseline`; set either to point elsewhere. The tool must be on
+a branch whose `Inputs/Baseline` ships no `OAS_Inputs/` folder — the export
+creates it.
+
+Arcs A and B solve the taper in closed form and take about five minutes, nearly
+all of it the twist/alpha optimization and one WingCalc sizing. **Arc C still uses
+the old depth loop** and takes about an hour: with `wingbox_pct` free under
+`root_le_fixed` the chord carries a `(p0/p)` factor, width stops being affine in
+the taper alone, and the one-line inversion does not apply.
+
+Three things that will bite:
+
+- **Do not run the same arc, profile and section concurrently.** The deck
+  directory is wiped and rebuilt on every sizing, so two runs sharing a tag delete
+  each other's files mid-run. Different arcs or sections are fine — the tag
+  carries both.
+- **A wrapper script needs `if __name__ == "__main__"`.** The sizer uses a spawn
+  pool and a spawn child re-imports `__main__`, so without the guard every worker
+  re-runs the whole solve.
+- **`--region-a-rule` exists for a reason.** Arc A defaults to `preserved`;
+  `root_le_fixed` is infeasible for it (see `ARCHS`).
+
+### What the deck is told, and what it keeps
+
+`write_deck` overwrites only what the design actually determines, and prints each
+one. Everything else is the deck's:
+
+| written | held |
+|---|---|
+| `AC_Weight`, per case, as `MTOW - (1 - Fuel_fraction) * wing_fuel` | `Wing Estimated weight` — inertia relief, so it wants structure **plus systems**; the sizer returns structure only, so iterating onto its output converges to the wrong quantity |
+| `Total wingbox span` | `Fwd spar X/Z at BL0` — the fixed point the LE/TE move around; rewriting it translated the wing 49 in against the gear and cg stations |
+| `OAS_Inputs/` — contours on the design's **own** section, `*_spar.csv`, `*_lift_mtow.csv` | the access cut-out, now derived inside the tool |
+
+The two in the left column that were missing for a long time were the section and
+the spanload: the export shipped the **baseline** loft and no lift file, so
+WingCalc sized a box about 30% shallower than every reported depth claimed, on an
+elliptical spanload. Both are worth checking in the run log — `write_deck` prints
+the section it shipped and names the spanload file, or says it is falling back.
+
 ### DOE limitation: neither baseline's section is inside the grid
 
 | | max camber | at x/c | DOE grid |

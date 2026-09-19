@@ -84,7 +84,16 @@ PROFILES = {                    # (root t/c, tip/root) -> the 5 spline control p
     "capped":  (0.220, 0.75),   # inside conventional thickness, 343.0 nmi
 }
 ARCHS = {          # region A end, region A rule, pinned straight line, rear schedule
-    "A": (REGION_A_AS_BUILT_IN, "root_le_fixed", None, SCHEDULE_A),
+    # Arc A is "preserved", NOT "root_le_fixed". Under root_le_fixed the product
+    # p * c is held invariant, so pinning p at 0.750 SHRINKS region A's chord from
+    # 105 to 95.13 in and the box tops out at 71.49 * (1 - 0.12/p) <= 62.91 in --
+    # under the 65 in the inboard nacelle needs, at ANY p (arc_a_constfrac derives
+    # the bound). It is infeasible by construction, and the SLSQP run that looked
+    # like it worked never reached feasibility: exit mode 9, three of five width
+    # stations violated, and width_req_in was never written to the JSON so nothing
+    # compared them. The shipped Arc A design point has always used "preserved".
+    # --region-a-rule overrides this per run.
+    "A": (REGION_A_AS_BUILT_IN, "preserved", None, SCHEDULE_A),
     "B": (w2.REGION_A_END_IN, "preserved", w2.FRONT_PCT, SCHEDULE),
     "C": (w2.REGION_A_END_IN, "root_le_fixed", None, SCHEDULE),
 }
@@ -312,8 +321,18 @@ def probe_map(prob, y_ail=Y_AIL):
             f"inversion.")
 
     slope = (wb - wa) / (lb - la)
+    # The delivered t/c distribution rides along: it is what the SplineComp actually
+    # produced from the requested control points, sampled at the true mid-panel
+    # stations, and comparing it against the request is the only way to see that the
+    # two differ (plot_toc_request.py).
+    m = np.asarray(prob.get_val("wing.mesh", units="m")) / config.SCALE
+    ym = np.abs(m[0, :, 1])
     return {"intercept_in": wa - slope * la, "slope_in": slope,
-            "toc_ail": toc_a, "lam0": lam0}
+            "toc_ail": toc_a, "lam0": lam0,
+            "y_panel_in": 0.5 * (ym[:-1] + ym[1:]),
+            "y_node_in": ym,
+            "toc_panel": np.asarray(prob.get_val("wing.t_over_c")).ravel(),
+            "toc_cp": np.asarray(prob.get_val("wing.t_over_c_cp")).ravel()}
 
 
 def solve_taper(pmap, req_in, bounds):
@@ -584,7 +603,10 @@ def _finish(r, arc, profile, label, blend, cp_toc):
     oas = {"mesh": np.asarray(prob.get_val("wing.mesh", units="m")), "toc": toc_full,
            "plate": comp.plate, "stick": comp.stick, "y_junction": 674.9,
            "airfoil": airfoil, "spanload": spanload}
-    tag = f"{arc}_{profile}"
+    # The deck directory is wiped and rebuilt on every sizing, so two runs sharing a
+    # tag delete each other's files mid-run. Include the section: arc/profile alone
+    # collided the moment two airfoils were compared side by side.
+    tag = f"{arc}_{profile}" + ("" if AIRFOIL_NAME is None else f"_{AIRFOIL_NAME}")
     # The sizer places the access cut-out from ONE wing-wide stringer pair
     # (default / alternative) in planformIn.csv, but each bay carries a different
     # stringer range -- bay 16 carries Stg 1..6, bay 19 carries Stg 6..9 -- so no
@@ -645,7 +667,17 @@ if __name__ == "__main__":
     ap.add_argument("--profile", required=True, choices=sorted(PROFILES))
     ap.add_argument("--airfoil", default="as-built",
                     help="database section name, or 'as-built' (default)")
+    ap.add_argument("--region-a-rule", choices=("preserved", "root_le_fixed"),
+                    default=None,
+                    help="override the arc's region-A chord rule; see ARCHS for why "
+                         "arc A is 'preserved'")
     a = ap.parse_args()
+
+    if a.region_a_rule is not None:
+        y_a, _rule, pin_p, sched = ARCHS[a.arc]
+        ARCHS[a.arc] = (y_a, a.region_a_rule, pin_p, sched)
+        print(f"region A rule: {_rule} -> {a.region_a_rule} (override)", flush=True)
+    print(f"arc {a.arc}: region A rule '{ARCHS[a.arc][1]}'", flush=True)
 
     RET, C_MAX_T = section(a.airfoil)
     print(f"section {a.airfoil}: c_max_t {C_MAX_T:.4f}", flush=True)
