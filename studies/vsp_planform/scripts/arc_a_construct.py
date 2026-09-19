@@ -131,6 +131,18 @@ def evaluate(taper_B, case, cmt_at, p, schedule, stations, rule="root_le_fixed")
     r["t_over_c_cp"] = cp.tolist()
     r["toc_full"] = toc
     r["mesh"] = np.asarray(prob.get_val("wing.mesh", units="m"))
+    # The 1 g spanload at MTOW, off this same trimmed state. Carried on the result
+    # so the WingCalc export ships the load the design was actually solved at
+    # instead of WingCalc's elliptical fallback.
+    alpha_d = float(prob.get_val("alpha", units="deg")[0])
+    ca, sa = np.cos(np.radians(alpha_d)), np.sin(np.radians(alpha_d))
+    strip = np.asarray(prob.get_val(f"{POINT}.aero_states.wing_sec_forces")).sum(axis=0)
+    lift_n = strip[:, 2] * ca - strip[:, 0] * sa
+    y_mid = 0.5 * (ym[:-1] + ym[1:])
+    width_in = np.asarray(prob.get_val(f"{POINT}.wing.widths", units="m")) / config.SCALE
+    order = np.argsort(y_mid)
+    r["spanload"] = (y_mid[order], width_in[order],
+                     (lift_n / width_in / 4.4482216)[order])
     return r
 
 

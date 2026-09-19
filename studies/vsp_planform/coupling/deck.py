@@ -41,7 +41,7 @@ from studies.vsp_planform.coupling import geometry as wg
 # RAISES rather than falling back when it is missing, so a wrong root fails loudly.
 WC_ROOT = Path(os.environ.get(
     "WINGCALC_ROOT",
-    Path.home() / "Documents" / "Structures-WingCalc_Tool-rust"))
+    Path.home() / "Documents" / "Structures-WingCalc_Tool"))
 
 # V3.5.3_ref was a locally-built deck and is not in the repository; a fresh clone
 # has V3.5.1-V3.5.4. V3.5.3 is the substitute because the PLY BOUNDS are what
@@ -111,9 +111,11 @@ def write_deck(src, dst, mtow_lb, w_wing_lb, oas=None):
         # reference run (PlanL and all four V3.5.x) carries the same 898.09/77.435.
         # Rewriting it from the OAS mesh translates the whole wing against the
         # gear and cg stations -- a 49 in error when tried.
+        # Only the span is still a planformIn key. The spar chord ratios moved OUT of
+        # this file and into OAS_Inputs/*_spar.csv, so writing them here did nothing --
+        # but it still PRINTED "aft 0.7500" while the spar file said 0.7403, which is
+        # a log that contradicts the geometry actually sized. The scalars are gone.
         repl = {
-            "Fwd spar chord ratio": f"Fwd spar chord ratio,Geom,{FRONT_PCT:.4f},",
-            "Aft spar chord ratio": f"Aft spar chord ratio,Geom,{AFT_PCT_SCALAR:.4f},",
             "Total wingbox span": f"Total wingbox span,Geom,{WINGBOX_SPAN_IN:.1f},in",
         }
         out2 = []
@@ -121,10 +123,15 @@ def write_deck(src, dst, mtow_lb, w_wing_lb, oas=None):
             key = line.split(",")[0].strip()
             out2.append(repl.get(key, line))
         pf.write_text("\n".join(out2) + "\n", encoding="utf-8")
-        print(f"  planform: fwd {FRONT_PCT:.4f} / aft {AFT_PCT_SCALAR:.4f}, "
-              f"wingbox span {WINGBOX_SPAN_IN:.0f} in", flush=True)
+        print(f"  planform: wingbox span {WINGBOX_SPAN_IN:.0f} in "
+              f"(spar ratios come from the spar file below, not from planformIn)",
+              flush=True)
 
-        vsp = dst / "OpenVSP"
+        # OAS_Inputs, not OpenVSP: the tool renamed the folder and now REJECTS a deck
+        # carrying the old name (io/oas.py), which is the right call -- nothing in it
+        # comes from OpenVSP any more. The Baseline deck ships without the folder at
+        # all and waits for this export to create it.
+        vsp = dst / "OAS_Inputs"
         if vsp.exists():
             shutil.rmtree(vsp)
         # The spar file goes with the surface. Without it a V3.6 deck falls back to
@@ -132,19 +139,28 @@ def write_deck(src, dst, mtow_lb, w_wing_lb, oas=None):
         # ships the OFFSET construction there, 0.750c rising to 0.8044c) -- so the
         # wing would be sized on a box the OAS run never saw.
         from studies.vsp_planform import config as _cfg
-        _csv, n, spar = wg.export(
+        _csv, n, spar, lift = wg.export(
             oas["mesh"], oas["toc"], oas["plate"], oas["stick"],
             vsp, name="OAS_" + BASELINE, max_ws_in=oas["y_junction"],
             front_pct=_cfg.WINGBOX_FRONT_PCT,
-            rear_schedule=_cfg.WINGBOX_REAR_SCHEDULE)
-        print(f"  geometry: {n} stations exported to {vsp.name}/", flush=True)
+            rear_schedule=_cfg.WINGBOX_REAR_SCHEDULE,
+            airfoil=oas.get("airfoil"), spanload=oas.get("spanload"))
+        print(f"  geometry: {n} stations exported to {vsp.name}/, section "
+              f"{oas.get('airfoil') or 'BASELINE LOFT (no design section supplied)'}",
+              flush=True)
+        print(f"  spanload: "
+              f"{lift.name if lift is not None else 'NONE -- WingCalc will use its elliptical fallback'}",
+              flush=True)
         print(f"  spar:     {spar.name}, front {_cfg.WINGBOX_FRONT_PCT:.4f}c, "
               f"rear schedule {tuple((float(a), float(b)) for a, b in _cfg.WINGBOX_REAR_SCHEDULE)}",
               flush=True)
 
-    # Last, because it reads the geometry just written: the access cut-out has to
-    # land on a stringer that exists in every bay of THIS planform.
-    resolve_cutout(dst)
+    # The access cut-out USED to be resolved here: the deck named one wing-wide
+    # stringer pair and no single pair suited every bay of every planform, so this
+    # module picked the alternative itself. The tool now derives it internally
+    # (geometry/topology.py:_determine_co_stg) and 'Cut-out alternative STG location'
+    # is no longer an input, so there is nothing left to resolve. resolve_cutout()
+    # is kept below, unused, only until the arc scripts stop importing it.
 
 
 def _stg_number(text):

@@ -292,8 +292,14 @@ if __name__ == "__main__":
     if not (viol or not dep_ok):
         comp = list(lifting_surfaces(read_degen_csv(
             config.BASELINES[w2.BASELINE])).values())[0][0]
+        # The design's OWN section and load. Shipping the baseline loft instead
+        # sized a box ~30% shallower than the reported depth, because the baseline
+        # keeps 0.56 of its thickness at this spar where the blend keeps 0.82.
         oas = {"mesh": best["mesh"], "toc": best["toc_full"],
-               "plate": comp.plate, "stick": comp.stick, "y_junction": 674.9}
+               "plate": comp.plate, "stick": comp.stick, "y_junction": 674.9,
+               "airfoil": {"inboard": n_in, "outboard": n_out,
+                           "f_start": f0, "f_end": f1},
+               "spanload": best.get("spanload")}
         w = A.W_SEED_LB
         passes = int(os.environ.get("ARC_W_PASSES", "8"))
         from pathlib import Path
@@ -345,7 +351,10 @@ if __name__ == "__main__":
                 "weight_history": hist, "sizing_error": sizing_error,
                 "converged": bool(hist) and abs(hist[-1]["residual_lb"]) < A.W_TOL_LB,
                 "success": True})
-    for k in ("mesh", "depth_span_in", "depth_span_y"):
+    for k in ("mesh", "depth_span_in", "depth_span_y", "spanload"):
         ser.pop(k, None)          # large, and downstream replays the design instead
+    # spanload is a tuple of arrays -- not reachable by the `.tolist()` rule above,
+    # and it is already written to the deck as *_lift_mtow.csv, so it is dropped
+    # rather than encoded.
     json.dump(ser, open(out, "w"), indent=2)
     print(f"  wrote {out}")

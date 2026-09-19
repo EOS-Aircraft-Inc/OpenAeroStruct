@@ -161,7 +161,7 @@ def build_problem(name, mesh, stick, regions, planform0, extra=None):
 
 
 def add_optimization(prob, name, mesh, planform0, s_ref0, mode="fixed_cl", weight=None,
-                     pct_dv=True):
+                     pct_dv=True, taper_dv=True):
     """Attach the driver, design variables, constraints and objective.
 
     ``pct_dv=False`` leaves ``wing.wingbox_pct`` OUT of the design variables, for a
@@ -171,6 +171,15 @@ def add_optimization(prob, name, mesh, planform0, s_ref0, mode="fixed_cl", weigh
     for linesearch". Measured on arc A -- the control converges, bounds pinned at
     0.750 fails, and the same run with the variable simply absent converges. A fixed
     quantity should not be a design variable at all.
+
+    ``taper_dv=False`` does the same for ``wing.taper_B``, for a planform whose taper
+    has already been solved in closed form (``arc_optimal_toc.solve_taper``). With
+    neither geometry variable free the chord distribution is frozen for the life of
+    the problem, so ``wingbox_width`` and the ``S_ref`` floor become CONSTANTS. They
+    are dropped rather than carried: a constraint no design variable can move is an
+    all-zero row in the Jacobian, which is what put SLSQP into a degenerate active
+    set and cost it 100 iterations for nothing. They are checked once instead --
+    solving the taper is what makes them true by construction.
     """
     model = prob.model
 
@@ -181,7 +190,9 @@ def add_optimization(prob, name, mesh, planform0, s_ref0, mode="fixed_cl", weigh
         model.add_design_var(
             "wing.wingbox_pct", lower=config.WINGBOX_CHORD_PCT_BOUNDS[0], upper=config.WINGBOX_CHORD_PCT_BOUNDS[1]
         )
-    model.add_design_var("wing.taper_B", lower=config.TAPER_B_BOUNDS[0], upper=config.TAPER_B_BOUNDS[1])
+    if taper_dv:
+        model.add_design_var("wing.taper_B", lower=config.TAPER_B_BOUNDS[0], upper=config.TAPER_B_BOUNDS[1])
+    geom_free = pct_dv or taper_dv
     model.add_design_var("wing.twist_cp", lower=tw_lower, upper=tw_upper, units="deg")
     model.add_design_var("alpha", lower=-5.0, upper=12.0, units="deg")
 
@@ -193,7 +204,7 @@ def add_optimization(prob, name, mesh, planform0, s_ref0, mode="fixed_cl", weigh
         "twist_abs", lower=config.TWIST_BOUNDS[0], upper=config.TWIST_BOUNDS[1], units="deg", ref=config.TWIST_BOUNDS[1]
     )
 
-    if name == "plan_l":
+    if name == "plan_l" and geom_free:
         # The wingbox must stay at least as wide as required at every station in
         # config.WINGBOX_WIDTH_STATIONS -- 65 in out to y = 100 in on the stock
         # settings, more stations once the rear spar kinks. The width comes out
@@ -233,7 +244,18 @@ def add_optimization(prob, name, mesh, planform0, s_ref0, mode="fixed_cl", weigh
         # and the cruise CL falls out as a result worth reporting.
         q = 0.5 * config.RHO * config.V_MS**2
         s_ref_sized = weight / (q * config.MAX_CRUISE_CL)
-        model.add_constraint(f"{POINT}.wing.S_ref", lower=s_ref_sized, ref=s_ref_sized)
+        if geom_free:
+            model.add_constraint(f"{POINT}.wing.S_ref", lower=s_ref_sized, ref=s_ref_sized)
+        else:
+            # Frozen geometry: area cannot move, so this is a fact to check rather
+            # than a constraint to carry. Failing loudly beats optimizing inside an
+            # infeasible box and reporting the result as converged.
+            s_now = float(prob.get_val(f"{POINT}.wing.S_ref")[0])
+            if s_now < s_ref_sized - 1e-9:
+                raise ValueError(
+                    f"S_ref {s_now:.4f} m^2 is below the cruise-CL floor "
+                    f"{s_ref_sized:.4f} m^2 and the geometry is frozen, so no design "
+                    f"variable can fix it. Raise MAX_CRUISE_CL or free the taper.")
         model.add_objective("drag", ref=1.0e4)
     else:
         raise ValueError(f"unknown mode {mode!r}")

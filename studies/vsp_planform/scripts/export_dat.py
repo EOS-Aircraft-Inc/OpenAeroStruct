@@ -63,7 +63,8 @@ sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(_HERE), "..", "
 
 from studies.vsp_planform import config                          # noqa: E402
 from studies.vsp_planform.degen_csv import read_degen_csv, lifting_surfaces  # noqa: E402
-from studies.vsp_planform.coupling.geometry import normalized_sections, section_at  # noqa: E402
+from studies.vsp_planform.coupling.geometry import (  # noqa: E402
+    normalized_sections, section_at, database_profile, blended_profile)
 import wing2_oas as w2                                           # noqa: E402
 from wing8_constchord_toc import REGION_A_AS_BUILT_IN            # noqa: E402
 from compare_classes import replay, baseline_case                # noqa: E402
@@ -105,36 +106,10 @@ def write_dat(path, header, x, upper, lower):
             fh.write(f"{xi:.16f} {yi:.16f}\n")
 
 
-def database_profile(name, x_grid):
-    """Camber and thickness of a database section, normalized by chord, on x_grid.
-
-    Split rather than returned as upper/lower because the two are scaled
-    differently: the thickness carries the design's t/c, the camber does not.
-    """
-    import aerosandbox as asb
-    af = asb.Airfoil(name)
-    t = np.array([float(af.local_thickness(x_over_c=float(x))) for x in x_grid])
-    cam = np.array([float(af.local_camber(x_over_c=float(x))) for x in x_grid])
-    return cam, t
-
-
-def blended_profile(blend, x_grid):
-    """Camber and thickness of a SPANWISE section pair, as functions of y (inches).
-
-    A real lofted wing interpolates between two defining sections, so both camber and
-    thickness are blended; the thickness is then scaled to the station's t/c by the
-    caller, which is what preserves c_max_t and the retention curve.
-    """
-    cam_i, t_i = database_profile(blend["inboard"], x_grid)
-    cam_o, t_o = database_profile(blend["outboard"], x_grid)
-    f0, f1 = float(blend["f_start"]), float(blend["f_end"])
-    semi = 708.0
-
-    def at(y_in):
-        w = float(np.clip((abs(y_in) / semi - f0) / (f1 - f0), 0.0, 1.0))
-        return (1.0 - w) * cam_i + w * cam_o, (1.0 - w) * t_i + w * t_o
-
-    return at
+# database_profile / blended_profile now live in coupling/geometry.py, so the
+# loop exporter and this one build sections from the SAME code. They were
+# duplicated here, which is how the loop came to ship the baseline section
+# while this script shipped the design's own.
 
 
 SEMI_IN = 708.0

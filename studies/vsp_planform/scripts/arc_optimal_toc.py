@@ -130,6 +130,9 @@ ARCHS = {          # region A end, region A rule, pinned straight line, rear sch
 STRAIGHT_AFT_PCT = {"A": 0.750}
 
 
+AIRFOIL_NAME = None      # set by section(); the export needs the NAME, not just the curve
+
+
 def section(name=None):
     """The section this design is built on: as-built, or a database airfoil.
 
@@ -141,6 +144,8 @@ def section(name=None):
     chord at the spar against the as-built's 0.096, which is 20 in of chord not
     spent buying depth.
     """
+    global AIRFOIL_NAME
+    AIRFOIL_NAME = None if name in (None, "as-built") else name
     if name in (None, "as-built"):
         af = asbuilt()
     else:
@@ -250,11 +255,102 @@ def spar_at_aileron(schedule):
     return float(rear_spar_fraction(Y_AIL, schedule))
 
 
-def optimize(y_a_in, rule, pin_p, cp_toc, c_req, schedule, fix_pct=None):
+def width_stations(spar_ail, c_req):
+    """The box-width requirements, in inches. ONE definition.
+
+    The aileron entry is the depth requirement re-encoded: at a fixed spar station
+    depth is strictly proportional to chord, so ``depth >= DEPTH_REQ`` is exactly
+    ``chord >= c_req``, and the box width there is ``(spar - front) * chord``. The
+    model and the closed-form inversion both read this, so they cannot disagree.
+    """
+    return ((100.0, 65.0), (176.0, 65.0), (356.0, 55.0),
+            (Y_AIL, (spar_ail - w2.FRONT_PCT) * c_req),
+            (674.9, w2.JUNCTION_BOX_IN))
+
+
+def probe_map(prob, y_ail=Y_AIL):
+    """Measure width(taper_B) and the delivered t/c at the aileron. Two evaluations.
+
+    ``RegionPlanform`` builds every chord as
+    ``c0 * (p0/p)**e * (1 + (lam-1)*t) / (1 + (lam0-1)*t)`` (param.py:546), which is
+    AFFINE in ``lam`` with everything else frozen -- the component declares the
+    matching analytic partial for exactly that reason. So two evaluations pin the
+    map exactly, and no search is needed to invert it.
+
+    The delivered t/c does not depend on ``lam``: the spanwise stations are fixed
+    for the life of the problem (span is pinned and no design variable moves a
+    station), so the ``t_over_c`` spline is sampled at the same panel midpoints
+    whatever the taper. That is CHECKED here rather than assumed -- if it ever stops
+    holding, the inversion below silently solves the wrong problem.
+    """
+    def read(lam):
+        prob.set_val("wing.taper_B", float(lam))
+        prob.run_model()
+        w = np.asarray(prob.get_val("wingbox_width", units="m")).ravel() / config.SCALE
+        m = np.asarray(prob.get_val("wing.mesh", units="m")) / config.SCALE
+        ym = np.abs(m[0, :, 1]); yp = 0.5 * (ym[:-1] + ym[1:])
+        toc = np.asarray(prob.get_val("wing.t_over_c")).ravel()
+        return w, float(np.interp(y_ail, yp, toc))
+
+    lam0 = float(prob.get_val("wing.taper_B")[0])
+    la, lb = lam0, lam0 + 0.10
+    wa, toc_a = read(la)
+    wb, toc_b = read(lb)
+    prob.set_val("wing.taper_B", lam0)
+
+    # Tolerance is RELATIVE and deliberately not machine-epsilon: sampling the
+    # spline at panel midpoints carries ~1e-7 of round-off even when the stations
+    # are identical. Depth is linear in t/c, so a relative drift of eps moves the
+    # delivered depth by eps -- 1e-5 is four orders inside the tolerance the
+    # requirement itself carries, while still catching a real taper dependence.
+    drift = abs(toc_b - toc_a) / max(abs(toc_a), 1e-12)
+    if drift > 1e-5:
+        raise RuntimeError(
+            f"t/c at the aileron moved {drift:.2e} (relative) when taper_B changed "
+            f"{la:.3f} -> {lb:.3f}. The closed-form taper assumes it does not, so "
+            f"the spanwise stations must now depend on the taper. Re-derive the "
+            f"inversion.")
+
+    slope = (wb - wa) / (lb - la)
+    return {"intercept_in": wa - slope * la, "slope_in": slope,
+            "toc_ail": toc_a, "lam0": lam0}
+
+
+def solve_taper(pmap, req_in, bounds):
+    """The smallest taper_B that clears every width station. Closed form.
+
+    Each station's width is affine in the taper, and every requirement is a FLOOR,
+    so each station names a minimum taper and the binding one is simply the largest.
+    Drag rises monotonically with taper over the whole feasible range (measured:
+    out/logs/taper_sweep_arcA.json), so that smallest feasible value IS the optimum
+    -- this replaces the search, it does not approximate it.
+
+    A station with zero slope sits in region A, where the chord is frozen and no
+    design variable can move it. Such a station is either already satisfied or the
+    design is infeasible; it cannot be "optimized" either way.
+    """
+    a, b = np.asarray(pmap["intercept_in"]), np.asarray(pmap["slope_in"])
+    req = np.asarray(req_in, dtype=float)
+    need, frozen_short = [], []
+    for i, (ai, bi, wi) in enumerate(zip(a, b, req)):
+        if abs(bi) < 1e-9:
+            if ai < wi - 1e-6:
+                frozen_short.append((i, ai, wi))
+            continue
+        need.append((wi - ai) / bi)
+    if frozen_short:
+        raise ValueError(
+            "width stations in region A are short and the taper cannot reach them: "
+            + "; ".join(f"station {i}: {got:.2f} in against {want:.2f} required"
+                        for i, got, want in frozen_short))
+    lam = max(need) if need else bounds[0]
+    return float(np.clip(lam, *bounds)), need
+
+
+def optimize(y_a_in, rule, pin_p, cp_toc, c_req, schedule, fix_pct=None,
+             probe=False, taper_fixed=None):
     spar_ail = spar_at_aileron(schedule)
-    stations = ((100.0, 65.0), (176.0, 65.0), (356.0, 55.0),
-                (Y_AIL, (spar_ail - w2.FRONT_PCT) * c_req),
-                (674.9, w2.JUNCTION_BOX_IN))
+    stations = width_stations(spar_ail, c_req)
     w2.REAR_SCHEDULE, w2.WIDTH_STATIONS = schedule, stations
     config.WINGBOX_FRONT_PCT = w2.FRONT_PCT
     config.WINGBOX_REAR_SCHEDULE = schedule
@@ -295,16 +391,29 @@ def optimize(y_a_in, rule, pin_p, cp_toc, c_req, schedule, fix_pct=None):
         n_cp = int(np.asarray(prob.get_val("wing.t_over_c_cp")).size)
         cp = np.linspace(cp_toc[0], cp_toc[0] * cp_toc[1], n_cp)
         prob.set_val("wing.t_over_c_cp", cp)
+        if taper_fixed is not None:
+            prob.set_val("wing.taper_B", float(taper_fixed))
         prob.run_model()
+        if probe:
+            return probe_map(prob)
         s0 = float(prob.get_val(f"{POINT}.wing.S_ref")[0])
         alpha0 = trim_alpha(prob, w2.W / (q * s0))
+        # A quantity pinned by the arc is not a design variable. pin_p collapses
+        # the bounds to a single value, and SLSQP carrying a zero-range variable on
+        # its own bound is the documented "positive directional derivative for
+        # linesearch" failure (run_opt.add_optimization). Treat pin_p exactly as
+        # fix_pct: set it, and leave it out.
         ro.add_optimization(prob, "plan_l", mesh, planform0, s0, mode="fixed_lift",
-                            weight=w2.W, pct_dv=(fix_pct is None))
+                            weight=w2.W,
+                            pct_dv=(fix_pct is None and pin_p is None),
+                            taper_dv=(taper_fixed is None))
         prob.set_val("wing.t_over_c_cp", cp)          # setup() reset it
         if pin_p is not None:
             prob.set_val("wing.wingbox_pct", pin_p)
         if fix_pct is not None:
             prob.set_val("wing.wingbox_pct", fix_pct)   # setup() reset it
+        if taper_fixed is not None:
+            prob.set_val("wing.taper_B", float(taper_fixed))   # setup() reset it
         prob.set_val("alpha", alpha0, units="deg")
         prob.run_model()
         prob.run_driver()
@@ -372,6 +481,47 @@ def solve(arc, profile):
 
     # --- depth: c_req from the DELIVERED t/c, and for a straight aft spar also
     #     from the DELIVERED p, since the spar station is then a design outcome.
+    p_pinned = fix_pct if fix_pct is not None else pin_p
+    if p_pinned is not None:
+        # The taper is SOLVED, not searched. Two evaluations measure the affine
+        # width(taper) map and the delivered t/c at the aileron; the requirement
+        # then inverts exactly. The old loop below re-ran a full SLSQP up to five
+        # times to chase the same number and, on arc A, returned the identical
+        # infeasible point every pass.
+        seed = optimize(y_a, rule, pin_p, cp_toc, 1.0, schedule,
+                        fix_pct=fix_pct, probe=True)
+        ret_ail = _ret(spar_ail)
+        c_req = DEPTH_REQ / (ret_ail * seed["toc_ail"])
+        req_in = [w for _, w in width_stations(spar_ail, c_req)]
+        lam, per_station = solve_taper(seed, req_in, config.TAPER_B_BOUNDS)
+        binding = int(np.argmax([-1e30 if not np.isfinite(v) else v
+                                 for v in per_station])) if per_station else -1
+        print(f"  {label}: t/c at the aileron {seed['toc_ail']:.5f}, retention "
+              f"{ret_ail:.4f} -> c_req {c_req:.2f} in", flush=True)
+        print(f"  {label}: taper_B solved = {lam:.6f} (per-station minima "
+              f"{[round(v, 4) for v in per_station]}, binding index {binding})",
+              flush=True)
+        r = optimize(y_a, rule, pin_p, cp_toc, c_req, schedule,
+                     fix_pct=fix_pct, taper_fixed=lam)
+        err = r["depth_delivered_in"] - DEPTH_REQ
+        print(f"  {label}: depth delivered {r['depth_delivered_in']:.2f} in "
+              f"({err:+.3f} vs the {DEPTH_REQ:.1f} in requirement, "
+              f"{100 * err / DEPTH_REQ:+.1f}%), drag {r['drag_N']:.1f} N", flush=True)
+    else:
+        r = _solve_depth_loop(y_a, rule, pin_p, cp_toc, schedule, fix_pct,
+                              spar_ail, straight_aft, _ret, label)
+
+    return _finish(r, arc, profile, label, blend, cp_toc)
+
+
+def _solve_depth_loop(y_a, rule, pin_p, cp_toc, schedule, fix_pct, spar_ail,
+                      straight_aft, _ret, label):
+    """The original search. Still used when the spar fraction is a design variable.
+
+    With ``wingbox_pct`` free under ``root_le_fixed`` the chord carries a ``(p0/p)``
+    factor, so width is no longer affine in the taper alone and the one-line
+    inversion does not apply. Arc C is the case.
+    """
     toc_use = None
     for p in range(1, MAX_PASS + 1):
         if toc_use is None:                     # seed from the baseline loft
@@ -395,12 +545,45 @@ def solve(arc, profile):
         if err >= -TOL_IN:
             break
         toc_use = r["toc_delivered_ail"]
+    return r
 
+
+def _finish(r, arc, profile, label, blend, cp_toc):
+    """Weight, range and bookkeeping -- identical for both taper paths."""
     # --- weight: bi-level fixed point, damped
     prob = r.pop("_prob"); toc_full = r.pop("_toc_full")
     comp = list(lifting_surfaces(read_degen_csv(config.BASELINES[w2.BASELINE])).values())[0][0]
+
+    # THE SECTION THE DESIGN IS ON, not the baseline loft. Arc A picks goe16k
+    # outboard precisely because it keeps 0.811 of its thickness at the far-aft
+    # spar against e694's 0.640; exporting the baseline instead threw that away and
+    # sized a box ~30% shallower than every reported depth claimed.
+    if blend is not None:
+        airfoil = {"inboard": blend[0], "outboard": blend[1],
+                   "f_start": blend[2], "f_end": blend[3]}
+    else:
+        airfoil = AIRFOIL_NAME          # None means the as-built loft, correctly
+
+    # The 1 g spanload at MTOW, off the SAME trimmed state the drag came from.
+    # Without it WingCalc silently substitutes an elliptical distribution.
+    alpha = float(prob.get_val("alpha", units="deg")[0])
+    ca, sa = np.cos(np.radians(alpha)), np.sin(np.radians(alpha))
+    sec_f = np.asarray(prob.get_val(f"{POINT}.aero_states.wing_sec_forces"))
+    strip = sec_f.sum(axis=0)                                   # (ny-1, 3), newtons
+    lift_n = strip[:, 2] * ca - strip[:, 0] * sa
+    m_in = np.asarray(prob.get_val("wing.mesh", units="m")) / config.SCALE
+    y_node = np.abs(m_in[0, :, 1])
+    y_mid = 0.5 * (y_node[:-1] + y_node[1:])
+    width_in = np.asarray(prob.get_val(f"{POINT}.wing.widths", units="m")) / config.SCALE
+    lift_lb_in = (lift_n / width_in) / 4.4482216                # N/in -> lbf/in
+    order = np.argsort(y_mid)                                   # root -> tip
+    spanload = (y_mid[order], width_in[order], lift_lb_in[order])
+    print(f"  {label}: spanload {2 * float((lift_lb_in * width_in).sum()):.0f} lb "
+          f"over both wings at alpha {alpha:.3f} deg", flush=True)
+
     oas = {"mesh": np.asarray(prob.get_val("wing.mesh", units="m")), "toc": toc_full,
-           "plate": comp.plate, "stick": comp.stick, "y_junction": 674.9}
+           "plate": comp.plate, "stick": comp.stick, "y_junction": 674.9,
+           "airfoil": airfoil, "spanload": spanload}
     tag = f"{arc}_{profile}"
     # The sizer places the access cut-out from ONE wing-wide stringer pair
     # (default / alternative) in planformIn.csv, but each bay carries a different

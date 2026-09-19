@@ -21,6 +21,57 @@ import numpy as np
 SCALE = 0.0254  # m per inch
 
 
+def database_profile(name, x_grid):
+    """Camber and thickness of a database section, normalized by chord, on x_grid.
+
+    Split rather than returned as upper/lower because the two are scaled
+    differently: the thickness carries the design's t/c, the camber does not.
+    """
+    import aerosandbox as asb
+    af = asb.Airfoil(name)
+    t = np.array([float(af.local_thickness(x_over_c=float(x))) for x in x_grid])
+    cam = np.array([float(af.local_camber(x_over_c=float(x))) for x in x_grid])
+    return cam, t
+
+
+def blended_profile(blend, x_grid, semi_in=708.0):
+    """Camber and thickness of a SPANWISE section pair, as a function of y (inches)."""
+    cam_i, t_i = database_profile(blend["inboard"], x_grid)
+    cam_o, t_o = database_profile(blend["outboard"], x_grid)
+    f0, f1 = float(blend["f_start"]), float(blend["f_end"])
+
+    def at(y_in):
+        w = float(np.clip((abs(y_in) / semi_in - f0) / (f1 - f0), 0.0, 1.0))
+        return (1.0 - w) * cam_i + w * cam_o, (1.0 - w) * t_i + w * t_o
+
+    return at
+
+
+def write_spanload(path, name, y_in, width_in, lift_lb_per_in, note=""):
+    """Write the ``*_lift_mtow.csv`` companion: the 1 g spanload at MTOW.
+
+    WingCalc reads ``y_in``, ``width_in`` and ``lift_lb_per_in`` and uses only the
+    SHAPE, rescaling it to each load case's ``Nz_lift * AC_Weight``. Without this
+    file it falls back to an elliptical spanload measured from the fuselage side --
+    a different load on the same wing, and silently so.
+    """
+    y = np.asarray(y_in, dtype=float)
+    w = np.asarray(width_in, dtype=float)
+    q = np.asarray(lift_lb_per_in, dtype=float)
+    with path.open("w", encoding="utf-8") as fh:
+        say = lambda t: print(t, file=fh)
+        say(f"# {name} -- spanwise lift distribution, 1 g, TRIMMED, at MTOW.")
+        say("# Written by studies/vsp_planform/coupling/geometry.py from the same")
+        say("# trimmed OAS state the drag was taken from, so load and geometry agree.")
+        if note:
+            say(f"# {note}")
+        say(f"# Integrated over the half wing: {float((q * w).sum()):.2f} lb")
+        say("y_in,width_in,lift_lb_per_in")
+        for yi, wi, qi in zip(y, w, q):
+            say(f"{yi:.4f},{wi:.6f},{qi:.6f}")
+    return path
+
+
 def normalized_sections(plate, stick):
     """Baseline section shapes as (span_frac, x/c, upper/c, lower/c)."""
     n_sec = plate.num_secs
@@ -66,7 +117,7 @@ def write_dat(path, x_grid, upper, lower, header):
 
 
 def export(mesh_m, toc_panel, plate, stick, out_dir, name="OAS_export", max_ws_in=None, n_x=201,
-           front_pct=None, rear_schedule=None):
+           front_pct=None, rear_schedule=None, airfoil=None, spanload=None):
     """Write ``out_dir/<name>.csv`` and one ``.dat`` per station.
 
     mesh_m     : OAS mesh, (nx, ny, 3), metres
@@ -76,6 +127,16 @@ def export(mesh_m, toc_panel, plate, stick, out_dir, name="OAS_export", max_ws_i
     front_pct  : box front edge, fraction of chord. With ``rear_schedule``,
                  also writes ``<name>_spar.csv``.
     rear_schedule : ``((y_in, x/c), ...)`` breakpoints for the rear spar.
+    airfoil    : the section the design is actually built on -- a database name, or
+                 ``{"inboard", "outboard", "f_start", "f_end"}`` for a spanwise blend.
+                 WITHOUT IT THE BASELINE SECTION IS SUBSTITUTED, which is not a
+                 cosmetic difference: measured near the aileron the baseline peaks at
+                 x/c 0.317 and keeps 0.56 of its thickness at a 0.74c spar, where the
+                 e694/goe16k blend peaks at 0.499 and keeps 0.82. Depth is
+                 ``retention * t/c * chord``, so sizing on the wrong one understates
+                 the box by ~30% while every reported number still says 7.00 in.
+    spanload   : ``(y_in, width_in, lift_lb_per_in)`` for the ``*_lift_mtow.csv``
+                 companion. Omitted, WingCalc falls back to an elliptical spanload.
 
     THE SPAR FILE IS NOT OPTIONAL ON A V3.6 DECK. Those decks carry no
     'Aft spar chord ratio' row in planformIn.csv, so WingCalc resolves the
@@ -113,15 +174,33 @@ def export(mesh_m, toc_panel, plate, stick, out_dir, name="OAS_export", max_ws_i
     frac, x_n, up_n, lo_n = normalized_sections(plate, stick)
     x_grid = 0.5 * (1 - np.cos(np.linspace(0.0, np.pi, n_x)))   # cosine, LE-clustered
 
+    prof_at = None
+    if airfoil is not None:
+        if isinstance(airfoil, str):
+            _cam, _t = database_profile(airfoil, x_grid)
+            prof_at = lambda _y: (_cam, _t)          # noqa: E731 -- one section, no y
+        else:
+            prof_at = blended_profile(airfoil, x_grid)
+
     span0, span1 = ws[keep][0], ws[keep][-1]
     blocks = []
     for idx in np.flatnonzero(keep):
-        f = 0.0 if span1 == span0 else (ws[idx] - span0) / (span1 - span0)
-        up, lo = section_at(f, frac, x_n, up_n, lo_n, x_grid)
-        t_now = float(np.max(up - lo))
-        if t_now > 1e-9:
-            scale = float(toc_node[idx]) / t_now
-            up, lo = up * scale, lo * scale
+        if prof_at is None:
+            f = 0.0 if span1 == span0 else (ws[idx] - span0) / (span1 - span0)
+            up, lo = section_at(f, frac, x_n, up_n, lo_n, x_grid)
+            t_now = float(np.max(up - lo))
+            if t_now > 1e-9:
+                scale = float(toc_node[idx]) / t_now
+                up, lo = up * scale, lo * scale
+        else:
+            # Thickness carries the design's t/c; camber does not. Scaling the two
+            # together (which the baseline branch above does) would change the
+            # camber line as a side effect of a thickness change.
+            cam, thk = prof_at(ws[idx])
+            t_now = float(np.max(thk))
+            if t_now > 1e-9:
+                thk = thk * (float(toc_node[idx]) / t_now)
+            up, lo = cam + 0.5 * thk, cam - 0.5 * thk
         dat = f"{name}_{idx}.dat"
         write_dat(out_dir / dat, x_grid, up, lo, f"# {name} station {idx}, ws {ws[idx]:.4f} in")
         blocks.append((dat, idx, le[idx], te[idx], chord[idx]))
@@ -140,12 +219,16 @@ def export(mesh_m, toc_panel, plate, stick, out_dir, name="OAS_export", max_ws_i
             fh.write(f"Trailing Edge Point, {tep[0]:.6f}, {tep[1]:.6f}, {tep[2]:.6f}\n")
             fh.write(f"Chord, {c:.6f}\n")
             fh.write("#" * 40 + "\n\n")
+    lift_path = None
+    if spanload is not None:
+        lift_path = write_spanload(out_dir / f"{name}_lift_mtow.csv", name, *spanload)
+
     spar_path = None
     if front_pct is not None and rear_schedule is not None:
         spar_path = _write_spar(out_dir / f"{name}_spar.csv", name,
                                 [b[1] for b in blocks], ws, chord,
                                 float(front_pct), rear_schedule)
-    return csv_path, len(blocks), spar_path
+    return csv_path, len(blocks), spar_path, lift_path
 
 
 def _write_spar(path, name, idxs, ws, chord, front_pct, rear_schedule):
