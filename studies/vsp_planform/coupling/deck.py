@@ -76,21 +76,48 @@ AFT_PCT_SCALAR = 0.750
 WINGBOX_SPAN_IN = 1356.0
 BASELINE = "const_chord"
 
+def _wing_loading_value(deck, key):
+    """One ``Name,Value,Units`` row out of wingLoadingIn.csv."""
+    for line in (deck / "wingLoadingIn.csv").read_text(encoding="utf-8-sig").splitlines():
+        parts = [c.strip() for c in line.split(",")]
+        if parts and parts[0] == key:
+            return float(parts[1])
+    raise KeyError(f"{key!r} not found in {deck / 'wingLoadingIn.csv'}")
+
+
 def write_deck(src, dst, mtow_lb, w_wing_lb, oas=None):
     """Copy the deck, update the weights, and re-export the OAS geometry."""
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(src, dst)
 
+    # AC_Weight IS NOT MTOW FOR EVERY CASE, and writing MTOW into every row was
+    # wrong. Wing fuel is inertia RELIEF against up-bending, so the critical 2.5 g
+    # up case is the one with an EMPTY wing -- and the heaviest aircraft that can
+    # have an empty wing is MTOW minus the wing fuel. The deck says exactly that:
+    # 81,920 lb on the rows at Fuel_fraction 0 against 86,000 lb at 1, a 4,080 lb
+    # difference, which is 2 x the 2,040 lb per-side tank (wing_loading.py applies
+    # "Max fuel weight outboard tank" to ONE half wing). Overwriting the lot with
+    # MTOW asked for 86,000 lb carried with dry tanks -- a case the aircraft cannot
+    # fly, with no fuel relief, so the 2.5 g cases were sized ~5% heavy.
+    wing_fuel_lb = 2.0 * _wing_loading_value(dst, "Max fuel weight outboard tank")
     lc = dst / "loadCasesIn.csv"
     rows = list(csv.reader(lc.open(newline="", encoding="utf-8-sig")))
     head = rows[0]
     col = head.index("AC_Weight")
+    fcol = head.index("Fuel_fraction")
+    seen = {}
     for r in rows[1:]:
-        if len(r) > col:
-            r[col] = f"{mtow_lb:.4f}"
+        if len(r) > max(col, fcol):
+            frac = float(r[fcol])
+            w = mtow_lb - (1.0 - frac) * wing_fuel_lb
+            r[col] = f"{w:.4f}"
+            seen[round(frac, 4)] = w
     with lc.open("w", newline="", encoding="utf-8") as fh:
         csv.writer(fh).writerows(rows)
+    print("  weights:  " + ", ".join(
+        f"Fuel_fraction {f:g} -> {w:.0f} lb" for f, w in sorted(seen.items()))
+        + f"  (wing fuel {wing_fuel_lb:.0f} lb)", flush=True)
 
     wl = dst / "wingLoadingIn.csv"
     out = []
