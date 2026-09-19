@@ -1,11 +1,12 @@
 """Requested t/c against what OpenAeroStruct actually delivers, for each arc.
 
-The profile is asked for as a LINEAR ramp on 5 spline control points, root to
-root*ratio (arc_optimal_toc.PROFILES). What reaches the drag model is whatever
-``om.SplineComp(method="bsplines", order=4)`` makes of those control points,
-sampled at the true mid-panel stations. The two are not the same curve, and the
-difference is not cosmetic: depth is ``retention * t/c * chord``, so the delivered
-t/c at the aileron is what sets the required chord, the area and the weight.
+The profile is asked for as a linear ramp in t/c, root to root*ratio
+(arc_optimal_toc.PROFILES). Setting those values ON the control points does NOT
+deliver it -- ``om.SplineComp(method="bsplines", order=4)`` approximates its control
+points, and the delivered curve sagged 3.0% below the line inboard and rode above it
+outboard. ``solve_toc_cp`` inverts the basis instead, so the control points are
+pre-compensated and the DISTRIBUTION is the request. This figure is the check:
+delivered should sit on top of requested, and the control points should not.
 
 Nothing is optimized here -- each arc is built and run once, which takes a minute.
 
@@ -77,7 +78,7 @@ def main():
         ax.plot(y, toc, "o-", color="#33527a", ms=3.2, lw=1.8,
                 label="delivered by the SplineComp")
         ax.plot(y_cp, cp, "s", color="#a8331f", ms=8, mfc="none", mew=2,
-                label="the 5 control points sent")
+                label="the 5 control points sent (pre-compensated)")
         ax.axvline(A.Y_AIL, color="#a8331f", ls="--", lw=1.0)
         ax.annotate("aileron", xy=(A.Y_AIL, 0.98), xycoords=("data", "axes fraction"),
                     ha="center", va="top", fontsize=8.5, color="#a8331f")
@@ -88,8 +89,8 @@ def main():
         ax.legend(fontsize=8.5, loc="upper right")
 
     axes[-1].set_xlabel("spanwise station  y  [in]")
-    fig.suptitle("t/c requested vs delivered — a linear ramp on the control points "
-                 "is not a linear distribution", fontsize=12)
+    fig.suptitle("t/c requested vs delivered — the control points are SOLVED for, so "
+                 "the distribution is the request", fontsize=12)
     out = os.path.join(FIGS, "toc_request_vs_delivered.png")
     fig.tight_layout(rect=(0, 0, 1, 0.975))
     fig.savefig(out, dpi=150)

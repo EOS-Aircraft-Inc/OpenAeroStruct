@@ -264,6 +264,58 @@ def spar_at_aileron(schedule):
     return float(rear_spar_fraction(Y_AIL, schedule))
 
 
+def solve_toc_cp(prob, root_toc, ratio):
+    """Control points whose spline OUTPUT is the linear ramp, not whose VALUES are.
+
+    ``np.linspace`` on the control points does NOT give a linear t/c. ``SplineComp``
+    with ``method="bsplines"`` approximates its control points rather than passing
+    through them, so the delivered curve sags below the line inboard, crosses near
+    mid-span and rides above it outboard -- 3.0% at worst, and +2.43% at the aileron,
+    where it sets ``c_req = depth / (retention * t/c)`` and therefore the chord, the
+    area and the weight. ``plot_toc_request.py`` measures it.
+
+    The spline is LINEAR in its control points, so inverting it is a least-squares
+    solve, and an order-4 basis represents a straight line exactly -- the residual
+    below is machine noise, not a fit error.
+
+    Both traps the study hit before are closed here. The basis is probed from the
+    LIVE model, so it is sampled at the true mid-panel stations OAS interpolates at
+    (``utils/interpolation.py``, ``mid_panel=True``); rebuilding it on evenly-spaced
+    points silently solved a different problem. And the result is checked, because a
+    target the basis cannot represent comes back as a quiet bad fit -- the earlier
+    attempt returned negative t/c and nonsense drag.
+    """
+    saved = np.asarray(prob.get_val("wing.t_over_c_cp")).copy()
+    n = saved.size
+    # The mesh is an OUTPUT, so it does not exist until the model has run once --
+    # reading it straight after setup() gives zeros and the span normalisation below
+    # divides by zero, silently producing NaN control points.
+    prob.run_model()
+    ys = np.abs(np.asarray(prob.get_val("wing.mesh", units="m"))[0, :, 1])
+    s_node = (ys - ys[0]) / (ys[-1] - ys[0])
+    s = 0.5 * (s_node[:-1] + s_node[1:])           # mid-panel, as the spline is read
+    target = root_toc + (root_toc * ratio - root_toc) * s
+
+    basis = np.empty((target.size, n))
+    for i in range(n):
+        e = np.zeros(n)
+        e[i] = 1.0
+        prob.set_val("wing.t_over_c_cp", e)
+        prob.run_model()
+        basis[:, i] = np.asarray(prob.get_val("wing.t_over_c")).ravel()
+
+    cp, *_ = np.linalg.lstsq(basis, target, rcond=None)
+    resid = float(np.max(np.abs(basis @ cp - target)))
+    prob.set_val("wing.t_over_c_cp", saved)
+    if resid > 1e-6 or cp.min() <= 0.0:
+        raise RuntimeError(
+            "the t/c inversion did not close: residual {:.3e}, control points {}. A "
+            "non-positive control point or a residual this size means the basis "
+            "cannot represent the requested distribution."
+            .format(resid, np.round(cp, 5)))
+    return cp, resid
+
+
 def width_stations(spar_ail, c_req):
     """The box-width requirements, in inches. ONE definition.
 
@@ -407,8 +459,7 @@ def optimize(y_a_in, rule, pin_p, cp_toc, c_req, schedule, fix_pct=None,
             ro.build_surface = orig_build_surface
         if fix_pct is not None:
             prob.set_val("wing.wingbox_pct", fix_pct)
-        n_cp = int(np.asarray(prob.get_val("wing.t_over_c_cp")).size)
-        cp = np.linspace(cp_toc[0], cp_toc[0] * cp_toc[1], n_cp)
+        cp, toc_resid = solve_toc_cp(prob, cp_toc[0], cp_toc[1])
         prob.set_val("wing.t_over_c_cp", cp)
         if taper_fixed is not None:
             prob.set_val("wing.taper_B", float(taper_fixed))
