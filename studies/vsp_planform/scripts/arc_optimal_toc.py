@@ -592,28 +592,45 @@ def _finish(r, arc, profile, label, blend, cp_toc):
     # "bay N has nowhere to put the access cut-out". That is a deck-configuration
     # limit, not a property of the design, so it must not cost the aero result:
     # the weight is recorded as unavailable and the t/c, depth and drag stand.
-    w, hist, sizing_error = W_SEED_LB, [], None
-    for p in range(1, W_PASSES + 1):
-        print(f"  {label} weight pass {p}: W_in {w:.1f} lb", flush=True)
-        try:
-            wcdeck.write_deck(wcdeck.WC_DECK, Path(LOGS) / f"deck_arc{tag}", mission.MTOW_LB, w, oas=oas)
-            w_new = wcdeck.run_wingcalc(Path(LOGS) / f"deck_arc{tag}", Path(LOGS) / f"wc_arc{tag}")
-        except Exception as exc:
-            sizing_error = f"{type(exc).__name__}: {exc}"
-            print(f"  !!! {label} sizing FAILED: {sizing_error}", flush=True)
-            break
-        hist.append({"pass": p, "w_in_lb": w, "w_wing_lb": w_new, "residual_lb": w_new - w})
-        print(f"  >>> {label} p{p}: {w:.1f} -> {w_new:.1f} lb ({w_new - w:+.1f})", flush=True)
-        if abs(w_new - w) < W_TOL_LB:
-            break
-        w += 0.5 * (w_new - w)
+    # ONE sizing. The deck's wing-weight estimate is HELD, not iterated: see
+    # deck.write_deck for why the fixed point converged to the wrong quantity
+    # (structure only, no systems) and below its own quantisation noise.
+    # A sizing failure must not cost the aero result, so the weight is recorded
+    # as unavailable and the t/c, depth and drag still stand.
+    hist, sizing_error = [], None
+    w_assumed = wcdeck._wing_loading_value(wcdeck.WC_DECK, "Wing Estimated weight")
+    try:
+        wcdeck.write_deck(wcdeck.WC_DECK, Path(LOGS) / f"deck_arc{tag}", mission.MTOW_LB, oas=oas)
+        w_new = wcdeck.run_wingcalc(Path(LOGS) / f"deck_arc{tag}", Path(LOGS) / f"wc_arc{tag}")
+    except Exception as exc:
+        sizing_error = f"{type(exc).__name__}: {exc}"
+        print(f"  !!! {label} sizing FAILED: {sizing_error}", flush=True)
+    else:
+        hist.append({"pass": 1, "w_in_lb": w_assumed, "w_wing_lb": w_new,
+                      "residual_lb": w_new - w_assumed})
+        gap = w_new - w_assumed
+        print(f"  >>> {label} W_wing {w_new:.1f} lb, sized against a HELD estimate of "
+              f"{w_assumed:.1f} lb ({gap:+.1f}, {100 * gap / w_assumed:+.1f}%)", flush=True)
+        # The estimate is inertia relief, so it SHOULD sit above the structural
+        # result -- the difference is the wing systems the sizer does not model.
+        # A gap the other way means the relief is under-counted with no allowance
+        # left at all, which is the case actually worth flagging.
+        if gap > 0:
+            print(f"  !!! the held estimate {w_assumed:.0f} lb is BELOW the sized "
+                  f"structure {w_new:.0f} lb, so it carries no systems allowance and "
+                  f"under-counts the relief. Raise it.", flush=True)
+        else:
+            print(f"      implied wing systems allowance {-gap:.0f} lb "
+                  f"({-100 * gap / w_new:.1f}% of structure)", flush=True)
 
     r["sizing_error"] = sizing_error
     r["w_wing_lb"] = hist[-1]["w_wing_lb"] if hist else None
     r["batt_lb"] = mission.battery_lb(r["w_wing_lb"]) if hist else None
     r["R_nmi"] = mission.electric_range_nmi(r["w_wing_lb"], r["drag_N"]) if hist else None
     r["weight_history"] = hist
-    r["converged"] = bool(hist) and abs(hist[-1]["residual_lb"]) < W_TOL_LB
+    r["w_wing_assumed_lb"] = w_assumed
+    r["weight_method"] = "one sizing against the deck's held estimate; not iterated"
+    r["converged"] = bool(hist)      # a single sizing either produced a weight or did not
     r["arc"], r["profile"] = arc, profile
     if blend is not None:
         r["section_blend"] = {"inboard": blend[0], "outboard": blend[1],

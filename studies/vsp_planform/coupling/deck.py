@@ -85,7 +85,7 @@ def _wing_loading_value(deck, key):
     raise KeyError(f"{key!r} not found in {deck / 'wingLoadingIn.csv'}")
 
 
-def write_deck(src, dst, mtow_lb, w_wing_lb, oas=None):
+def write_deck(src, dst, mtow_lb, w_wing_lb=None, oas=None):
     """Copy the deck, update the weights, and re-export the OAS geometry."""
     if dst.exists():
         shutil.rmtree(dst)
@@ -119,13 +119,36 @@ def write_deck(src, dst, mtow_lb, w_wing_lb, oas=None):
         f"Fuel_fraction {f:g} -> {w:.0f} lb" for f, w in sorted(seen.items()))
         + f"  (wing fuel {wing_fuel_lb:.0f} lb)", flush=True)
 
-    wl = dst / "wingLoadingIn.csv"
-    out = []
-    for line in wl.read_text(encoding="utf-8-sig").splitlines():
-        if line.startswith("Wing Estimated weight,"):
-            line = f"Wing Estimated weight,{w_wing_lb:.4f},lbs"
-        out.append(line)
-    wl.write_text("\n".join(out) + "\n", encoding="utf-8")
+    # ``w_wing_lb=None`` KEEPS the deck's own estimate, and that is the default.
+    #
+    # This quantity is inertia relief -- the wing's weight acting down against its own
+    # lift -- so it wants the TOTAL weight hanging on the wing. What the sizer returns
+    # is W_wingbox + k_misc * W_secondary: structure and secondary structure only, no
+    # systems. Iterating the estimate down onto that output therefore converges to the
+    # WRONG quantity, under-counting the relief by the entire systems weight. A fixed
+    # estimate a few hundred pounds above the structural result is closer to the truth,
+    # not further from it -- and it is what the tool itself does (build_nacelle_report:
+    # "the wing's own inertia relief is not iterated against the wing weight the tool
+    # computes").
+    #
+    # It is also below the resolution of what was being iterated. Measured loop gain is
+    # about -0.054, so a 25 lb tolerance chased a 1.4 lb signal while flipping integer
+    # ply counts moved the answer 20-40 lb between neighbouring passes: the last run
+    # went 6834.8 -> 6806.6 -> 6848.8 on a monotonically falling input, twice with the
+    # wrong sign for that gain. That is quantisation, not convergence.
+    if w_wing_lb is None:
+        est = _wing_loading_value(dst, "Wing Estimated weight")
+        print(f"  wing weight: {est:.0f} lb, the deck's own estimate -- held, "
+              f"not iterated", flush=True)
+    else:
+        wl = dst / "wingLoadingIn.csv"
+        out = []
+        for line in wl.read_text(encoding="utf-8-sig").splitlines():
+            if line.startswith("Wing Estimated weight,"):
+                line = f"Wing Estimated weight,{w_wing_lb:.4f},lbs"
+            out.append(line)
+        wl.write_text("\n".join(out) + "\n", encoding="utf-8")
+        print(f"  wing weight: {w_wing_lb:.0f} lb, overriding the deck", flush=True)
 
     if oas is not None:
         # planformIn.csv: the box percentages and the wing's fore/aft anchor.

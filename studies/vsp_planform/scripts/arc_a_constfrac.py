@@ -287,7 +287,7 @@ if __name__ == "__main__":
               else "  NOT FEASIBLE -- depth short")
 
     # ---- weight, so this design can be compared with the other two on range ----
-    w_wing = batt = rng = None
+    w_wing = batt = rng = w_assumed = None
     hist, sizing_error = [], None
     if not (viol or not dep_ok):
         comp = list(lifting_surfaces(read_degen_csv(
@@ -300,26 +300,32 @@ if __name__ == "__main__":
                "airfoil": {"inboard": n_in, "outboard": n_out,
                            "f_start": f0, "f_end": f1},
                "spanload": best.get("spanload")}
-        w = A.W_SEED_LB
-        passes = int(os.environ.get("ARC_W_PASSES", "8"))
         from pathlib import Path
-        for i in range(1, passes + 1):
-            print(f"  weight pass {i}: W_in {w:.1f} lb", flush=True)
-            try:
-                wcdeck.write_deck(wcdeck.WC_DECK, Path(LOGS) / "deck_arcA_constfrac",
-                                  mission.MTOW_LB, w, oas=oas)
-                w_new = wcdeck.run_wingcalc(Path(LOGS) / "deck_arcA_constfrac",
-                                            Path(LOGS) / "wc_arcA_constfrac")
-            except Exception as exc:
-                sizing_error = f"{type(exc).__name__}: {exc}"
-                print(f"  !!! sizing FAILED: {sizing_error}", flush=True)
-                break
-            hist.append({"pass": i, "w_in_lb": w, "w_wing_lb": w_new,
-                         "residual_lb": w_new - w})
-            print(f"  >>> p{i}: {w:.1f} -> {w_new:.1f} lb ({w_new - w:+.1f})", flush=True)
-            if abs(w_new - w) < A.W_TOL_LB:
-                break
-            w += 0.5 * (w_new - w)
+        hist, sizing_error = [], None
+        w_assumed = wcdeck._wing_loading_value(wcdeck.WC_DECK, "Wing Estimated weight")
+        try:
+            wcdeck.write_deck(wcdeck.WC_DECK, Path(LOGS) / "deck_arcA_constfrac", mission.MTOW_LB, oas=oas)
+            w_new = wcdeck.run_wingcalc(Path(LOGS) / "deck_arcA_constfrac", Path(LOGS) / "wc_arcA_constfrac")
+        except Exception as exc:
+            sizing_error = f"{type(exc).__name__}: {exc}"
+            print(f"  !!! sizing FAILED: {sizing_error}", flush=True)
+        else:
+            hist.append({"pass": 1, "w_in_lb": w_assumed, "w_wing_lb": w_new,
+                          "residual_lb": w_new - w_assumed})
+            gap = w_new - w_assumed
+            print(f"  >>> W_wing {w_new:.1f} lb, sized against a HELD estimate of "
+                  f"{w_assumed:.1f} lb ({gap:+.1f}, {100 * gap / w_assumed:+.1f}%)", flush=True)
+            # The estimate is inertia relief, so it SHOULD sit above the structural
+            # result -- the difference is the wing systems the sizer does not model.
+            # A gap the other way means the relief is under-counted with no allowance
+            # left at all, which is the case actually worth flagging.
+            if gap > 0:
+                print(f"  !!! the held estimate {w_assumed:.0f} lb is BELOW the sized "
+                      f"structure {w_new:.0f} lb, so it carries no systems allowance and "
+                      f"under-counts the relief. Raise it.", flush=True)
+            else:
+                print(f"      implied wing systems allowance {-gap:.0f} lb "
+                      f"({-100 * gap / w_new:.1f}% of structure)", flush=True)
         if hist:
             w_wing = hist[-1]["w_wing_lb"]
             batt = mission.battery_lb(w_wing)
@@ -349,7 +355,9 @@ if __name__ == "__main__":
                 "depth_req_in": A.DEPTH_REQ,
                 "w_wing_lb": w_wing, "batt_lb": batt, "R_nmi": rng,
                 "weight_history": hist, "sizing_error": sizing_error,
-                "converged": bool(hist) and abs(hist[-1]["residual_lb"]) < A.W_TOL_LB,
+                "w_wing_assumed_lb": w_assumed,
+                "weight_method": "one sizing against the deck's held estimate; not iterated",
+                "converged": bool(hist),
                 "success": True})
     for k in ("mesh", "depth_span_in", "depth_span_y", "spanload"):
         ser.pop(k, None)          # large, and downstream replays the design instead
