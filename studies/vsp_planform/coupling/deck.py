@@ -85,21 +85,35 @@ def _wing_loading_value(deck, key):
     raise KeyError(f"{key!r} not found in {deck / 'wingLoadingIn.csv'}")
 
 
+def case_weight_lb(deck, mtow_lb, fuel_fraction):
+    """The aircraft weight a load case is flown at, lb.
+
+    AC_Weight IS NOT MTOW FOR EVERY CASE, and writing MTOW into every row was
+    wrong. Wing fuel is inertia RELIEF against up-bending, so the critical 2.5 g
+    up case is the one with an EMPTY wing -- and the heaviest aircraft that can
+    have an empty wing is MTOW minus the wing fuel. The deck says exactly that:
+    81,920 lb on the rows at Fuel_fraction 0 against 86,000 lb at 1, a 4,080 lb
+    difference, which is 2 x the 2,040 lb per-side tank (wing_loading.py applies
+    "Max fuel weight outboard tank" to ONE half wing). Overwriting the lot with
+    MTOW asked for 86,000 lb carried with dry tanks -- a case the aircraft cannot
+    fly, with no fuel relief, so the 2.5 g cases were sized ~5% heavy.
+
+    One function because two consumers need the same answer: ``write_deck`` writes
+    it into the deck WingCalc sizes, and ``studies.vsp_planform.weight`` reads it for
+    the Torenbeek terms (MTOW, landing weight). Two copies of this rule would let the
+    OAS weight and the WingCalc weight be cast in different aircraft weights.
+    """
+    wing_fuel_lb = 2.0 * _wing_loading_value(deck, "Max fuel weight outboard tank")
+    return mtow_lb - (1.0 - float(fuel_fraction)) * wing_fuel_lb
+
+
 def write_deck(src, dst, mtow_lb, w_wing_lb=None, oas=None):
     """Copy the deck, update the weights, and re-export the OAS geometry."""
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(src, dst)
 
-    # AC_Weight IS NOT MTOW FOR EVERY CASE, and writing MTOW into every row was
-    # wrong. Wing fuel is inertia RELIEF against up-bending, so the critical 2.5 g
-    # up case is the one with an EMPTY wing -- and the heaviest aircraft that can
-    # have an empty wing is MTOW minus the wing fuel. The deck says exactly that:
-    # 81,920 lb on the rows at Fuel_fraction 0 against 86,000 lb at 1, a 4,080 lb
-    # difference, which is 2 x the 2,040 lb per-side tank (wing_loading.py applies
-    # "Max fuel weight outboard tank" to ONE half wing). Overwriting the lot with
-    # MTOW asked for 86,000 lb carried with dry tanks -- a case the aircraft cannot
-    # fly, with no fuel relief, so the 2.5 g cases were sized ~5% heavy.
+    # Per-case AC_Weight: see case_weight_lb.
     wing_fuel_lb = 2.0 * _wing_loading_value(dst, "Max fuel weight outboard tank")
     lc = dst / "loadCasesIn.csv"
     rows = list(csv.reader(lc.open(newline="", encoding="utf-8-sig")))
@@ -110,7 +124,7 @@ def write_deck(src, dst, mtow_lb, w_wing_lb=None, oas=None):
     for r in rows[1:]:
         if len(r) > max(col, fcol):
             frac = float(r[fcol])
-            w = mtow_lb - (1.0 - frac) * wing_fuel_lb
+            w = case_weight_lb(dst, mtow_lb, frac)
             r[col] = f"{w:.4f}"
             seen[round(frac, 4)] = w
     with lc.open("w", newline="", encoding="utf-8") as fh:

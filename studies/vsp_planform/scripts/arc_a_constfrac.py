@@ -387,3 +387,25 @@ if __name__ == "__main__":
     # rather than encoded.
     json.dump(ser, open(out, "w"), indent=2)
     print(f"  wrote {out}")
+
+    # --- both reports, side by side, as every OAS study ends. Wrapped: the design
+    #     and its JSON are the result; a report failure must never cost them. The
+    #     OAS side is REFUSED (not written) if the rebuilt model does not reproduce
+    #     this design's drag -- this planform is constructed, not optimized, so that
+    #     is a real check here, not a formality.
+    from pathlib import Path as _P
+    wc_dir = _P(LOGS) / "wc_arcA_constfrac"
+    found = sorted(wc_dir.glob("Wing_Report*.html")) if wc_dir.is_dir() else []
+    try:
+        from studies.vsp_planform.viewer.pair import write_reports
+        oas_html, cmp_html = write_reports(
+            ser, seed_json=out, out_dir=wc_dir, wingcalc_html=found[-1] if found else None,
+            label=f"arc A constfrac / {a.profile} / {a.airfoil}")
+    except Exception as exc:
+        print(f"  !!! reports FAILED ({type(exc).__name__}: {exc}). The design above stands.",
+              flush=True)
+    else:
+        print("#" * 78)
+        print("  RESULTS -- open this one file:")
+        print("  " + str(cmp_html))
+        print("#" * 78)

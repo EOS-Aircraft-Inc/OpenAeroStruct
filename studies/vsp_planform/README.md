@@ -141,8 +141,12 @@ chordwise one — the reverse of what the fixed-alpha figures suggest. Raise
 python studies/vsp_planform/verify_roundtrip.py   # geometry-match proof
 python studies/vsp_planform/run_opt.py            # VLM drag optimization
 python studies/vsp_planform/airfoil_doe.py        # standalone airfoil DOE
-python -m pytest tests/vsp_planform_tests/ -q     # 73 tests
+python -m pytest tests/vsp_planform_tests/ -q     # 136 tests + 63 subtests
 ```
+
+**`test_coupling.py::TestGeometryExport` errors on `setUpClass` and has since
+commit f43902b**: `coupling/geometry.export` grew a third return value and the
+test still unpacks two. Three errors, unrelated to anything else in the suite.
 
 The DOE needs `pip install aerosandbox` (pure Python, bundles NeuralFoil; no
 XFoil binary). Nothing else needs OpenVSP — the CSV parser replaces it.
@@ -685,6 +689,187 @@ translated the wing 49 in against the gear and cg stations. `optimize_bay` does 
 read `wingSizingIn.csv`; it seeds from `optiObBay.csv`. And WingCalc takes a single
 scalar aft-spar ratio, so the 0.750 → 0.550 kink cannot be represented — 0.750 is
 used, correct inboard where the binding bays are.
+
+### The OAS wing weight — WingCalc's build-up, ported
+
+`arc_aerostruct.py` no longer borrows any weight from WingCalc. `W_wing` is
+WingCalc's own build-up (`weight/weight_calc.compute_wing_weight`, tool 0.63.0),
+recomputed inside the OpenMDAO model from the OAS box and the OAS geometry by
+[`studies/vsp_planform/weight/`](weight/):
+
+| module | what |
+|---|---|
+| `deck_inputs.py` | the Baseline deck WingCalc reads, with the two overrides `write_deck` applies (wingbox span; per-case `AC_Weight` via the shared `deck.case_weight_lb`) |
+| `buildup.py` | every term, in WingCalc's order: rib layout from the placement rules, smeared ribs, fasteners, splices, nacelle fitting loads and reinforcement, gear and W/F attach, ply drops, reference areas, Torenbeek secondary, lightning mesh, paint, `k_misc` |
+| `component.py` | the OpenMDAO wrapper, fed straight from the FEM |
+
+**Why this was possible.** What kept WingCalc out of the gradient loop is its
+differential-evolution *bay sizer*. None of the 3,437 lb of non-box weight comes
+from it — it is all algebra on geometry — so it ports as algebra, and only the
+sized box (skins, stringers, caps, webs) is replaced by OAS's FEM.
+
+**It is WingCalc's formula, checked term by term.** Handed WingCalc's own geometry
+and box, the port returns **6,816.44 lb against WingCalc's 6,816.41**; every term
+within 0.04%, every non-perimeter term to rounding, and the nacelle fitting loads,
+governing conditions and ply counts identical (`tests/vsp_planform_tests/test_weight.py`,
+fixture frozen from a 0.63.0 run). On OAS's own geometry and box at the Arc A datum
+it gives **6,821.4 lb (+0.07%)** — the residual is modelling: the box (+1.2%),
+splices (+8%, OAS's root-heavy box), ribs (−1.1%, the FEM's e694 section).
+
+**Partials.** The sized structure enters in three places — box weight, rib cell
+area, splice running weight — all linearly, so those partials are analytic
+(`buildup.dW_wing_dW_box` = 1.02 × (1 + 0.02 × 1.04)). Geometry is differenced;
+it moves only through twist here. Totals of `W_wing` against the thickness DVs
+match a finite difference of the whole model to 1e-10.
+
+**What does not port.** WingCalc brings each nacelle spar web up to its own sized
+cap before padding it. OAS has one smeared spar thickness and no cap, so the rule
+has nothing to act on: carried at zero, 34.1 lb at the datum, stated on the report.
+
+**Nacelles** now sit where WingCalc hangs them — x/c aft of the local LE, δZ above
+the elastic axis, inboard mass including the main gear (8,205 lb) — instead of on
+the elastic axis. See `arc_aerostruct.nacelle_spec`.
+
+**One thing found in WingCalc while porting, ported as-is.** `compute_wingtip_weight`
+builds Torenbeek Eq. 11.70's length term from `winglet_span × 1.5` in **inches**
+against `l_ref = 5.0`, which is **metres**. With the length in metres the wingtip
+is 29.4 lb rather than 50.1. The port reproduces WingCalc (it has to, to be a
+check on it); fixing it belongs in the WingCalc repo.
+
+### The OAS wing report — WingCalc's report, drawn from OAS
+
+`studies/vsp_planform/viewer/` writes an HTML report that is **the same page** as
+WingCalc's `Wing_Report*.html`: same CSS, same tab chrome, same tables, same plot
+styling, so the two can be opened side by side and a difference read as a
+*modelling* difference rather than a plotting one.
+
+#### Running an arc gives you both, side by side
+
+Nothing extra to run. `arc_optimal_toc.py` ends by writing the OAS report and a
+two-pane page next to WingCalc's own, in `out/logs/wc_arc<tag>/`:
+
+| file | what |
+|---|---|
+| `Wing_Reportdeck_arc<tag>.html` | WingCalc's report (~16 MB) |
+| `OAS_Wing_Report.html` | the same page, drawn from OAS (~1.8 MB) |
+| **`Compare_WingCalc_vs_OAS.html`** | **both in two resizable panes — open this one** |
+| `oas_report_case.json` | which design point the OAS report was drawn from |
+| `oas_report_thickness.json` | the sized skin/spar cps, cached |
+
+The reports cost about 20 s after the run is otherwise finished, because
+`arc_optimal_toc` sizes the box in WingCalc and not in OAS, so the OAS box is
+sized once here against the same 2.5 g case. `--no-reports` skips it. The whole
+step is wrapped: a viewer failure prints how to re-run it and leaves the
+converged design and its JSON untouched.
+
+**The shared tab bar on the compare page is best-effort, and the page says which
+it got.** Driving both panes from one bar means calling into each iframe, and
+Chrome gives every `file://` document its own opaque origin, so the call throws
+and each pane can only be driven by its own tab bar. The page probes once on load
+and then either shows a working bar or says plainly that the panes are
+independent. Serving the folder over `http://` from one origin re-enables it.
+
+#### Rendering a report on its own
+
+```powershell
+# from the converged design point -- one analysis, no optimizer
+& $OAS -m studies.vsp_planform.viewer.oas_report `
+    --json studies\vsp_planform\out\logs\arc_aerostruct_A_optimal_e694.json `
+    --case 0 --save-snapshot studies\vsp_planform\out\logs\oas_report_snapshot.json
+
+# re-render from the cached snapshot -- no OpenMDAO, no aerosandbox, under a second
+& $OAS -m studies.vsp_planform.viewer.oas_report `
+    --snapshot studies\vsp_planform\out\logs\oas_report_snapshot.json
+```
+
+`--case` takes an index into the four-point JSON or a substring of one label
+(`--case range` is ambiguous and says so). Six tabs: Planform, Cross section &
+VMT, Loading, Stress Results, Weight Visuals, Weight Summary. **No Optimization
+tab** — WingCalc's is a per-bay DE generation trace and OAS's SLSQP history is a
+different object.
+
+Three modules, split on what each is allowed to know:
+
+| | |
+|---|---|
+| `wingcalc_frontend.py` | WingCalc `viewer/wing_viewer.py` **vendored verbatim**, tool version 0.63.0. Pure: dicts in, HTML out, no OAS. Every edit is marked `[OAS]` and listed in its header, so drift is a diff away. Plotly 2.35.2 is inlined with its SHA-256 pinned, as in the original. |
+| `oas_snapshot.py` | Runs the Arc A aerostructural model once and flattens everything into one JSON dict, in inches / pounds / psi. |
+| `oas_report.py` | Snapshot → WingCalc-shaped payloads → page. Computes nothing. |
+
+**Every distribution is drawn twice**: as a line on OAS's own 34-panel grid, and
+as markers resampled onto WingCalc's 20 bay stations, so the two reports can be
+read against each other station by station instead of off two different grids.
+
+#### What the two tools actually disagree about
+
+Measured on the shipped Arc A point (`wc_arcA_optimal_e694` against
+`arc_aerostruct_A_optimal_e694.json`, drag objective, twist floor −1°):
+
+| | OAS | WingCalc | Δ |
+|---|---|---|---|
+| **wing, full build-up** | **6 821.4 lb** | **6 816.4 lb** | **+0.07%** |
+| sized box, winglet excluded (WS ≤ 674.95) | 3 418.2 lb | 3 379.1 lb | +1.2% |
+| skin (+ stringers, WingCalc) | 3 223.2 lb | 2 841.3 lb | +13.4% |
+| spar webs | 194.9 lb | 537.8 lb | −63.8% |
+| My at WS 54 (side of body), 2.5 g limit | −1.730e7 in-lb | −1.885e7 in-lb | −8.2% |
+| Mx at WS 0, 2.5 g limit | 1.09e6 in-lb | — | was 1.6e5 with the nacelles on the axis |
+| 1 g half-wing lift centroid | 301.6 in | 333.9 in | **−32.3 in** |
+
+Re-measured 2026-09-22 after the nacelles were moved to WingCalc's positions and
+the weight build-up was ported. The box matched to −0.26% before that; the match
+got worse and the model got better — the old agreement came from nacelles that
+put no torque into the box.
+
+Four differences are structural, not noise:
+
+- **The root.** WingCalc reacts the wing at the fuselage (BL 54) and carries no
+  lift inboard of it; OAS clamps the FEM at the centreline and lifts all the way
+  in. That is the whole of the +10.7% root moment and most of the −32 in centroid
+  — masking OAS's own lift inboard of 54 moves its centroid +21 in of the 32.
+- **The span.** WingCalc's wingbox runs to WS 678; OAS's outermost node inboard
+  of the winglet is the B|C junction at 674.95. 3.05 in, 0.45%, and the winglet
+  box it drops is 7.0 lb per side.
+- **The distribution, not the total.** The two agree on the box to 0.26% and
+  disagree on where it is: **OAS is +19% at the root and −39% at WS 601**,
+  because it has no minimum gauge, no buckling and no ply-drop non-optimum, so
+  it thins the outboard box until strength alone stops it (0.066 in of skin at
+  the tip against 0.72 in at the root). It also has no stringers, so its skin
+  absorbs their job — hence +12.5% of skin against −70% of spar.
+- **The section.** OAS has no stringers, no spar caps, no plies, no buckling, no
+  crippling and no Tsai-Wu (the deck's `Materials.csv` gives smeared laminate
+  properties, not lamina data, so Tsai-Wu cannot be fed). Its margins are four
+  von Mises points per element against one allowable. Every table that would
+  have listed the missing things renders an empty state saying so, and nothing
+  is interpolated into existence.
+
+Two more worth knowing. The elastic axis differs — OAS's FEM nodes sit at 0.426c
+(the box's height-weighted centre), WingCalc's is the mid-spar line at 0.435c — so
+torques are taken about axes about 1 in apart. And the nacelles now sit where
+WingCalc hangs them, forward of the box: the root torque went from 1.6e5 to
+1.09e6 in-lb and the root spar web from 0.105 to 0.142 in. Torsion still does not
+make the front web critical anywhere (22 of 27 elements are upper-skin critical,
+5 rear-web), because the one sizing case is a symmetric pull-up — the landing
+cases that twist the box hardest are the next thing missing.
+
+#### Traps
+
+- **`--case` matters.** The four design points differ only in objective and twist
+  floor, and picking the wrong one produces a report that looks right and is
+  about a different wing. A substring matching more than one is an error, not a
+  first match.
+- **The cut is the last node ≤ 678, not the nearest.** The nearest is 679.67 in,
+  which is one element *into* the winglet, and keeping it would put winglet
+  structure inside a total that says it excludes winglets.
+- **A converged JSON written before 2026-09-22 has no `skin_cp_m` / `spar_cp_m`.**
+  Twist and alpha alone rebuild the aero but leave the box at its seed — 2 703 lb
+  and failing at +0.34. The viewer detects this, re-runs the one minimum-mass
+  SLSQP stage and caches the result beside the JSON as `*.thickness.json`.
+- **VMT is integrated in the mirrored (left-wing) frame on purpose.** WingCalc's
+  sign convention (`loading/wing_loading.py`, lines 38–50) is stated in a local
+  triad — x′ outboard, y′ aft, z′ up — that is right-handed only on the left
+  wing. Up-bending gives **negative** My, which falls out with no negation
+  anywhere *because the local frame puts span on x′*; the global-frame intuition
+  gets it backwards.
 
 ### ~~The as-built section is better than any replacement found~~ — RETRACTED
 

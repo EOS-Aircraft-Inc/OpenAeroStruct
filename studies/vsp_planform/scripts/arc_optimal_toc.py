@@ -618,24 +618,18 @@ def _solve_depth_loop(y_a, rule, pin_p, cp_toc, schedule, fix_pct, spar_ail,
     return r
 
 
-def _finish(r, arc, profile, label, blend, cp_toc):
-    """Weight, range and bookkeeping -- identical for both taper paths."""
-    # --- weight: bi-level fixed point, damped
-    prob = r.pop("_prob"); toc_full = r.pop("_toc_full")
+def wingcalc_payload(prob, airfoil, label="", toc_full=None):
+    """What ``write_deck`` exports to WingCalc, from a converged OAS model.
+
+    One function for every study that hands a design to WingCalc, so the deck
+    WingCalc sizes is built the same way whichever script produced the design:
+    the mesh, the t/c, the design's OWN section, and the 1 g spanload at MTOW off
+    the same trimmed state the drag came from (without it WingCalc silently
+    substitutes an elliptical distribution).
+    """
     comp = list(lifting_surfaces(read_degen_csv(config.BASELINES[w2.BASELINE])).values())[0][0]
-
-    # THE SECTION THE DESIGN IS ON, not the baseline loft. Arc A picks goe16k
-    # outboard precisely because it keeps 0.811 of its thickness at the far-aft
-    # spar against e694's 0.640; exporting the baseline instead threw that away and
-    # sized a box ~30% shallower than every reported depth claimed.
-    if blend is not None:
-        airfoil = {"inboard": blend[0], "outboard": blend[1],
-                   "f_start": blend[2], "f_end": blend[3]}
-    else:
-        airfoil = AIRFOIL_NAME          # None means the as-built loft, correctly
-
-    # The 1 g spanload at MTOW, off the SAME trimmed state the drag came from.
-    # Without it WingCalc silently substitutes an elliptical distribution.
+    if toc_full is None:
+        toc_full = np.asarray(prob.get_val("wing.t_over_c")).ravel()
     alpha = float(prob.get_val("alpha", units="deg")[0])
     ca, sa = np.cos(np.radians(alpha)), np.sin(np.radians(alpha))
     sec_f = np.asarray(prob.get_val(f"{POINT}.aero_states.wing_sec_forces"))
@@ -648,12 +642,30 @@ def _finish(r, arc, profile, label, blend, cp_toc):
     lift_lb_in = (lift_n / width_in) / 4.4482216                # N/in -> lbf/in
     order = np.argsort(y_mid)                                   # root -> tip
     spanload = (y_mid[order], width_in[order], lift_lb_in[order])
-    print(f"  {label}: spanload {2 * float((lift_lb_in * width_in).sum()):.0f} lb "
-          f"over both wings at alpha {alpha:.3f} deg", flush=True)
+    if label:
+        print(f"  {label}: spanload {2 * float((lift_lb_in * width_in).sum()):.0f} lb "
+              f"over both wings at alpha {alpha:.3f} deg", flush=True)
+    return {"mesh": np.asarray(prob.get_val("wing.mesh", units="m")), "toc": toc_full,
+            "plate": comp.plate, "stick": comp.stick, "y_junction": 674.9,
+            "airfoil": airfoil, "spanload": spanload}
 
-    oas = {"mesh": np.asarray(prob.get_val("wing.mesh", units="m")), "toc": toc_full,
-           "plate": comp.plate, "stick": comp.stick, "y_junction": 674.9,
-           "airfoil": airfoil, "spanload": spanload}
+
+def _finish(r, arc, profile, label, blend, cp_toc):
+    """Weight, range and bookkeeping -- identical for both taper paths."""
+    # --- weight: bi-level fixed point, damped
+    prob = r.pop("_prob"); toc_full = r.pop("_toc_full")
+
+    # THE SECTION THE DESIGN IS ON, not the baseline loft. Arc A picks goe16k
+    # outboard precisely because it keeps 0.811 of its thickness at the far-aft
+    # spar against e694's 0.640; exporting the baseline instead threw that away and
+    # sized a box ~30% shallower than every reported depth claimed.
+    if blend is not None:
+        airfoil = {"inboard": blend[0], "outboard": blend[1],
+                   "f_start": blend[2], "f_end": blend[3]}
+    else:
+        airfoil = AIRFOIL_NAME          # None means the as-built loft, correctly
+
+    oas = wingcalc_payload(prob, airfoil, label, toc_full)
     # The deck directory is wiped and rebuilt on every sizing, so two runs sharing a
     # tag delete each other's files mid-run. Include the section: arc/profile alone
     # collided the moment two airfoils were compared side by side.
@@ -722,6 +734,9 @@ if __name__ == "__main__":
                     default=None,
                     help="override the arc's region-A chord rule; see ARCHS for why "
                          "arc A is 'preserved'")
+    ap.add_argument("--no-reports", action="store_true",
+                    help="skip the OAS report and the side-by-side page (they cost one "
+                         "OAS box sizing, about 20 s, after the run is otherwise done)")
     a = ap.parse_args()
 
     if a.region_a_rule is not None:
@@ -746,3 +761,33 @@ if __name__ == "__main__":
           f"depth {res['depth_delivered_in']:.2f} in, S_ref {res['S_ref']*10.7639104:.1f} ft2, "
           f"drag {res['drag_N']:.1f} N, {wtxt}")
     print(f"  wrote {out}")
+
+    # --- both reports, side by side. This runs AFTER the JSON is written and is
+    #     wrapped, because everything above it is the expensive part: a viewer bug
+    #     must cost a report, never a converged design. The OAS box is sized here
+    #     rather than earlier since arc_optimal_toc sizes in WingCalc, not in OAS.
+    if not a.no_reports:
+        tag = f"{a.arc}_{a.profile}{suffix}"
+        wc_dir = Path(LOGS) / f"wc_arc{tag}"
+        wc_html = wc_dir / f"Wing_Reportdeck_arc{tag}.html"
+        try:
+            from studies.vsp_planform.viewer.pair import write_reports
+            oas_html, cmp_html = write_reports(
+                {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in res.items()},
+                seed_json=out, out_dir=wc_dir,
+                wingcalc_html=wc_html if wc_html.is_file() else None,
+                label=f"arc {a.arc} / {a.profile} / {a.airfoil}")
+        except Exception as exc:
+            print(f"  !!! reports FAILED ({type(exc).__name__}: {exc}). The design above "
+                  f"stands; re-run the viewer alone with\n"
+                  f"      python -m studies.vsp_planform.viewer.oas_report --json {out}",
+                  flush=True)
+        else:
+            if not wc_html.is_file():
+                print(f"  !!! no WingCalc report at {wc_html}, so the left pane is empty",
+                      flush=True)
+            print(f"  wrote {oas_html}")
+            print("#" * 78)
+            print("  RESULTS -- open this one file:")
+            print(f"  {cmp_html}")
+            print("#" * 78)

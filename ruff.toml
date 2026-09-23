@@ -8,3 +8,13 @@ extend-exclude = [
     "openaerostruct/docs/_utils/patch.py",
     "openaerostruct/utils/plot_*.py",
 ]
+
+# [AI] The OAS wing report vendors WingCalc's report renderer verbatim
+# (studies/vsp_planform/viewer/wingcalc_frontend.py) so the two reports draw
+# identically and a difference between them reads as a modelling difference. Its
+# long lines are Plotly hovertemplate strings in the embedded JavaScript, and
+# rewrapping them would destroy the diff against the source file that is the only
+# way drift between the two copies gets spotted. Excluded rather than reformatted,
+# for exactly that reason.
+[lint.per-file-ignores]
+"studies/vsp_planform/viewer/wingcalc_frontend.py" = ["E501"]
